@@ -138,18 +138,21 @@ app.get("/api/stats", auth, async (req, res) => {
   });
 });
 
+// ✅ FIXED: Using full path /usr/local/bin/yt-dlp for Railway Linux server
+const YTDLP = "/usr/local/bin/yt-dlp";
+
 async function downloadVideo(videoId, url) {
   await Video.findByIdAndUpdate(videoId, { status: "downloading" });
   const dir = path.join(__dirname, "downloads");
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const out = path.join(dir, `${videoId}.mp4`);
 
-  // ✅ Auto-extract TikTok caption first
-  exec(`yt-dlp "${url}" --get-title --no-warnings`, async (err, stdout) => {
+  // Auto-extract TikTok caption first
+  exec(`${YTDLP} "${url}" --get-title --no-warnings`, async (err, stdout) => {
     const caption = stdout ? stdout.trim() : "";
 
     // Then download the video
-    exec(`yt-dlp "${url}" -o "${out}" --no-warnings --quiet`, async (err2) => {
+    exec(`${YTDLP} "${url}" -o "${out}" --no-warnings --quiet`, async (err2) => {
       if (err2) {
         await Video.findByIdAndUpdate(videoId, { status: "failed", error: err2.message });
         return;
