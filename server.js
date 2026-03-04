@@ -11,8 +11,7 @@ require("dotenv").config();
 
 const app = express();
 app.use(express.json());
-app.use(cors());
-
+app.use(cors({ origin: ["https://t2g.pages.dev", "http://localhost:5173"], credentials: true }));
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log("✅ MongoDB connected"))
   .catch(e => console.log("❌ DB Error:", e.message));
@@ -217,4 +216,5 @@ cron.schedule("* * * * *", async () => {
 });
 
 app.get("/", (req, res) => res.json({ status: "✅ Tok2Gram API running!" }));
+
 app.listen(process.env.PORT || 3001, () => console.log("🚀 Server on port 3001"));
