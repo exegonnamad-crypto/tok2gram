@@ -118,7 +118,8 @@ app.post("/api/videos/bulk", auth, async (req, res) => {
     const videos = await Video.insertMany(
       links.map(url => ({ userId: req.user.id, accountId, tiktokUrl: url.trim(), hashtags: account.hashtags }))
     );
-    videos.forEach(v => downloadVideo(v._id, v.tiktokUrl));
+    // ✅ 3 second delay between each download to avoid rate limiting
+    videos.forEach((v, i) => setTimeout(() => downloadVideo(v._id, v.tiktokUrl), i * 3000));
     res.json({ added: videos.length, message: "Videos queued!" });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -140,7 +141,6 @@ app.get("/api/stats", auth, async (req, res) => {
   });
 });
 
-// ✅ Pure Node.js TikTok downloader - NO Python, NO yt-dlp needed!
 async function getTikTokVideoUrl(tiktokUrl) {
   try {
     const apiUrl = `https://tikwm.com/api/?url=${encodeURIComponent(tiktokUrl)}&hd=1`;
