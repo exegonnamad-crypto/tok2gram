@@ -6,7 +6,9 @@ const cors = require("cors");
 const cron = require("node-cron");
 const fs = require("fs");
 const path = require("path");
-const YTDlpWrap = require("yt-dlp-wrap").default;
+const https = require("https");
+const http = require("http");
+const axios = require("axios");
 require("dotenv").config();
 
 const app = express();
@@ -16,12 +18,6 @@ app.use(cors({ origin: ["https://t2g.pages.dev", "http://localhost:5173"], crede
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log("✅ MongoDB connected"))
   .catch(e => console.log("❌ DB Error:", e.message));
-
-// ✅ Auto-download yt-dlp binary on startup
-const ytDlpWrap = new YTDlpWrap(require("path").join(__dirname, "yt-dlp"));
-YTDlpWrap.downloadFromGithub().then(() => {
-  console.log("✅ yt-dlp downloaded and ready!");
-}).catch(e => console.log("⚠️ yt-dlp download:", e.message));
 
 const User = mongoose.model("User", new mongoose.Schema({
   name: String,
@@ -144,6 +140,45 @@ app.get("/api/stats", auth, async (req, res) => {
   });
 });
 
+// ✅ Pure Node.js TikTok downloader - NO Python, NO yt-dlp needed!
+async function getTikTokVideoUrl(tiktokUrl) {
+  try {
+    const apiUrl = `https://tikwm.com/api/?url=${encodeURIComponent(tiktokUrl)}&hd=1`;
+    const response = await axios.get(apiUrl, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      timeout: 15000
+    });
+    const data = response.data;
+    if (data.code === 0 && data.data) {
+      return {
+        videoUrl: data.data.play || data.data.wmplay,
+        caption: data.data.title || ""
+      };
+    }
+    throw new Error("TikTok API failed: " + JSON.stringify(data));
+  } catch (e) {
+    throw new Error("Failed to get TikTok video: " + e.message);
+  }
+}
+
+function downloadFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    const proto = url.startsWith("https") ? https : http;
+    const file = fs.createWriteStream(dest);
+    proto.get(url, { headers: { "User-Agent": "Mozilla/5.0" } }, (response) => {
+      if (response.statusCode === 301 || response.statusCode === 302) {
+        file.close();
+        return downloadFile(response.headers.location, dest).then(resolve).catch(reject);
+      }
+      response.pipe(file);
+      file.on("finish", () => file.close(resolve));
+    }).on("error", (err) => {
+      fs.unlink(dest, () => {});
+      reject(err);
+    });
+  });
+}
+
 async function downloadVideo(videoId, url) {
   await Video.findByIdAndUpdate(videoId, { status: "downloading" });
   const dir = path.join(__dirname, "downloads");
@@ -151,23 +186,19 @@ async function downloadVideo(videoId, url) {
   const out = path.join(dir, `${videoId}.mp4`);
 
   try {
-    // Auto-extract caption
-    let caption = "";
-    try {
-      const info = await ytDlpWrap.getVideoInfo(url);
-      caption = info.title || "";
-    } catch(e) {}
-
-    // Download video
-    await ytDlpWrap.execPromise([url, "-o", out, "--no-warnings", "--quiet"]);
-
+    console.log(`📥 Getting TikTok video URL for: ${url}`);
+    const { videoUrl, caption } = await getTikTokVideoUrl(url);
+    console.log(`⬇️ Downloading video from: ${videoUrl}`);
+    await downloadFile(videoUrl, out);
     await Video.findByIdAndUpdate(videoId, {
       status: "downloaded",
       localPath: out,
       caption: caption
     });
+    console.log(`✅ Downloaded: ${videoId}`);
     uploadToCloudinary(videoId, out);
   } catch (err) {
+    console.error(`❌ Download failed: ${err.message}`);
     await Video.findByIdAndUpdate(videoId, { status: "failed", error: err.message });
   }
 }
@@ -239,4 +270,3 @@ cron.schedule("* * * * *", async () => {
 
 app.get("/", (req, res) => res.json({ status: "✅ Tok2Gram API running!" }));
 app.listen(process.env.PORT || 3001, () => console.log("🚀 Server on port 3001"));
-
