@@ -12,6 +12,7 @@ require("dotenv").config();
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: ["https://t2g.pages.dev", "http://localhost:5173"], credentials: true }));
+
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log("✅ MongoDB connected"))
   .catch(e => console.log("❌ DB Error:", e.message));
@@ -142,11 +143,24 @@ async function downloadVideo(videoId, url) {
   const dir = path.join(__dirname, "downloads");
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const out = path.join(dir, `${videoId}.mp4`);
-  // ✅ FIXED: using full path to yt-dlp.exe
-  exec(`"C:\\yt-dlp\\yt-dlp.exe" "${url}" -o "${out}" --no-warnings --quiet`, async (err) => {
-    if (err) { await Video.findByIdAndUpdate(videoId, { status: "failed", error: err.message }); return; }
-    await Video.findByIdAndUpdate(videoId, { status: "downloaded", localPath: out });
-    uploadToCloudinary(videoId, out);
+
+  // ✅ Auto-extract TikTok caption first
+  exec(`yt-dlp "${url}" --get-title --no-warnings`, async (err, stdout) => {
+    const caption = stdout ? stdout.trim() : "";
+
+    // Then download the video
+    exec(`yt-dlp "${url}" -o "${out}" --no-warnings --quiet`, async (err2) => {
+      if (err2) {
+        await Video.findByIdAndUpdate(videoId, { status: "failed", error: err2.message });
+        return;
+      }
+      await Video.findByIdAndUpdate(videoId, {
+        status: "downloaded",
+        localPath: out,
+        caption: caption
+      });
+      uploadToCloudinary(videoId, out);
+    });
   });
 }
 
@@ -216,5 +230,4 @@ cron.schedule("* * * * *", async () => {
 });
 
 app.get("/", (req, res) => res.json({ status: "✅ Tok2Gram API running!" }));
-
 app.listen(process.env.PORT || 3001, () => console.log("🚀 Server on port 3001"));
