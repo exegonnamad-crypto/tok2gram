@@ -4,9 +4,9 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
 const cron = require("node-cron");
-const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const YTDlpWrap = require("yt-dlp-wrap").default;
 require("dotenv").config();
 
 const app = express();
@@ -16,6 +16,12 @@ app.use(cors({ origin: ["https://t2g.pages.dev", "http://localhost:5173"], crede
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log("✅ MongoDB connected"))
   .catch(e => console.log("❌ DB Error:", e.message));
+
+// ✅ Auto-download yt-dlp binary on startup
+const ytDlpWrap = new YTDlpWrap();
+YTDlpWrap.downloadFromGithub().then(() => {
+  console.log("✅ yt-dlp downloaded and ready!");
+}).catch(e => console.log("⚠️ yt-dlp download:", e.message));
 
 const User = mongoose.model("User", new mongoose.Schema({
   name: String,
@@ -138,33 +144,32 @@ app.get("/api/stats", auth, async (req, res) => {
   });
 });
 
-// ✅ FIXED: Using full path /usr/local/bin/yt-dlp for Railway Linux server
-const YTDLP = "/usr/local/bin/yt-dlp";
-
 async function downloadVideo(videoId, url) {
   await Video.findByIdAndUpdate(videoId, { status: "downloading" });
   const dir = path.join(__dirname, "downloads");
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const out = path.join(dir, `${videoId}.mp4`);
 
-  // Auto-extract TikTok caption first
-  exec(`${YTDLP} "${url}" --get-title --no-warnings`, async (err, stdout) => {
-    const caption = stdout ? stdout.trim() : "";
+  try {
+    // Auto-extract caption
+    let caption = "";
+    try {
+      const info = await ytDlpWrap.getVideoInfo(url);
+      caption = info.title || "";
+    } catch(e) {}
 
-    // Then download the video
-    exec(`${YTDLP} "${url}" -o "${out}" --no-warnings --quiet`, async (err2) => {
-      if (err2) {
-        await Video.findByIdAndUpdate(videoId, { status: "failed", error: err2.message });
-        return;
-      }
-      await Video.findByIdAndUpdate(videoId, {
-        status: "downloaded",
-        localPath: out,
-        caption: caption
-      });
-      uploadToCloudinary(videoId, out);
+    // Download video
+    await ytDlpWrap.execPromise([url, "-o", out, "--no-warnings", "--quiet"]);
+
+    await Video.findByIdAndUpdate(videoId, {
+      status: "downloaded",
+      localPath: out,
+      caption: caption
     });
-  });
+    uploadToCloudinary(videoId, out);
+  } catch (err) {
+    await Video.findByIdAndUpdate(videoId, { status: "failed", error: err.message });
+  }
 }
 
 async function uploadToCloudinary(videoId, filePath) {
