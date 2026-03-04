@@ -18,7 +18,7 @@ mongoose.connect(process.env.MONGODB_URI)
   .catch(e => console.log("❌ DB Error:", e.message));
 
 // ✅ Auto-download yt-dlp binary on startup
-const ytDlpWrap = new YTDlpWrap();
+const ytDlpWrap = new YTDlpWrap(require("path").join(__dirname, "yt-dlp"));
 YTDlpWrap.downloadFromGithub().then(() => {
   console.log("✅ yt-dlp downloaded and ready!");
 }).catch(e => console.log("⚠️ yt-dlp download:", e.message));
@@ -239,3 +239,4 @@ cron.schedule("* * * * *", async () => {
 
 app.get("/", (req, res) => res.json({ status: "✅ Tok2Gram API running!" }));
 app.listen(process.env.PORT || 3001, () => console.log("🚀 Server on port 3001"));
+
