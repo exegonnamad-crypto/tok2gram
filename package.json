@@ -2,7 +2,6 @@
   "name": "tok2gram-backend",
   "version": "1.0.0",
   "scripts": {
-    "build": "pip install yt-dlp || true",
     "start": "node server.js"
   },
   "dependencies": {
@@ -13,6 +12,7 @@
     "express": "^4.18.2",
     "jsonwebtoken": "^9.0.0",
     "mongoose": "^7.0.0",
-    "node-cron": "^3.0.2"
+    "node-cron": "^3.0.2",
+    "yt-dlp-wrap": "^2.3.12"
   }
 }
