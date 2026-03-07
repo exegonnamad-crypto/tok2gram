@@ -9,7 +9,7 @@ const path = require("path");
 const https = require("https");
 const http = require("http");
 const axios = require("axios");
-const { IgApiClient } = require("instagram-private-api");
+const { spawn } = require("child_process");
 require("dotenv").config();
 
 const app = express();
@@ -177,28 +177,49 @@ app.delete("/api/me", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── INSTAGRAM LOGIN HELPER (instagram-private-api) ───────────────────────────
-async function igLogin(username, password, existingSession = null) {
-  const ig = new IgApiClient();
-  ig.state.generateDevice(username);
+// ── INSTAGRAPI via Python ─────────────────────────────────────────────────────
+function runPython(script) {
+  return new Promise((resolve) => {
+    const py = spawn("python3", ["-c", script]);
+    let out = "", err = "";
+    py.stdout.on("data", d => out += d.toString());
+    py.stderr.on("data", d => err += d.toString());
+    py.on("close", () => {
+      try { resolve(JSON.parse(out.trim())); }
+      catch { resolve({ success: false, error: err || "Python error" }); }
+    });
+    setTimeout(() => { py.kill(); resolve({ success: false, error: "Timeout" }); }, 120000);
+  });
+}
 
-  if (existingSession) {
-    try {
-      await ig.state.deserialize(existingSession);
-      // Quick check to verify session is still valid
-      await ig.account.currentUser();
-      console.log(`✅ Session reused for @${username}`);
-      return { ig, fresh: false };
-    } catch {
-      console.log(`🔄 Session expired for @${username}, re-logging in...`);
-    }
-  }
+async function instagrapiLogin(username, password, existingSession = null) {
+  const sessionCode = existingSession
+    ? `
+    import json
+    try:
+        cl.load_settings(json.loads(r'''${existingSession.replace(/'/g, "\\'")}'''))
+        cl.login('${username}', '${password}')
+    except:
+        cl = Client()
+        cl.delay_range = [2, 5]
+        cl.login('${username}', '${password}')
+    `
+    : `cl.login('${username}', '${password}')`;
 
-  await ig.simulate.preLoginFlow();
-  await ig.account.login(username, password);
-  await ig.simulate.postLoginFlow();
-  console.log(`✅ Logged in to @${username}`);
-  return { ig, fresh: true };
+  const script = `
+import sys, json
+try:
+    from instagrapi import Client
+    cl = Client()
+    cl.delay_range = [2, 5]
+    ${sessionCode}
+    session = json.dumps(cl.get_settings())
+    user = cl.account_info()
+    print(json.dumps({"success": True, "userId": str(cl.user_id), "username": str(user.username), "sessionData": session}))
+except Exception as e:
+    print(json.dumps({"success": False, "error": str(e)}))
+`;
+  return runPython(script);
 }
 
 // ── VERIFY INSTAGRAM CREDENTIALS ──────────────────────────────────────────────
@@ -206,25 +227,14 @@ app.post("/api/instagram/verify", auth, async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Username and password required" });
   try {
-    const { ig } = await igLogin(username, password);
-    const user = await ig.account.currentUser();
-    const session = await ig.state.serialize();
-    res.json({
-      success: true,
-      userId: user.pk.toString(),
-      username: user.username,
-      profilePic: user.profile_pic_url,
-      session: JSON.stringify(session),
-    });
-  } catch (e) {
-    const msg = e.message || "";
-    if (msg.includes("checkpoint")) {
-      res.status(400).json({ success: false, error: "Instagram requires verification (check your email/SMS for a code)" });
-    } else if (msg.includes("bad_password") || msg.includes("invalid_credentials")) {
-      res.status(400).json({ success: false, error: "Wrong username or password" });
+    const result = await instagrapiLogin(username, password);
+    if (result.success) {
+      res.json({ success: true, userId: result.userId, username: result.username, session: result.sessionData });
     } else {
-      res.status(400).json({ success: false, error: `Login failed: ${msg}` });
+      res.status(400).json({ success: false, error: result.error });
     }
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
@@ -248,18 +258,12 @@ app.post("/api/accounts", auth, async (req, res) => {
     // Test the credentials and get session
     let igUserId = "", sessionData = "", profilePic = "";
     try {
-      const { ig } = await igLogin(username, igPassword);
-      const user = await ig.account.currentUser();
-      igUserId = user.pk.toString();
-      profilePic = user.profile_pic_url || "";
-      const session = await ig.state.serialize();
-      sessionData = JSON.stringify(session);
+      const result = await instagrapiLogin(username, igPassword);
+      if (!result.success) throw new Error(result.error);
+      igUserId = result.userId || "";
+      sessionData = result.sessionData || "";
     } catch (e) {
-      const msg = e.message || "";
-      if (msg.includes("checkpoint")) {
-        return res.status(400).json({ error: "Instagram requires email/SMS verification. Please log in manually on Instagram first, then try again." });
-      }
-      return res.status(400).json({ error: `Instagram login failed: ${msg}` });
+      return res.status(400).json({ error: `Instagram login failed: ${e.message}` });
     }
 
     const encryptedPassword = await bcrypt.hash(igPassword, 10);
@@ -295,12 +299,10 @@ app.put("/api/accounts/:id", auth, async (req, res) => {
     } else {
       // New password provided - re-login and get fresh session
       try {
-        const { ig } = await igLogin(update.username || "", update.igPassword);
-        const user = await ig.account.currentUser();
-        update.igUserId = user.pk.toString();
-        update.profilePic = user.profile_pic_url || "";
-        const session = await ig.state.serialize();
-        update.sessionData = JSON.stringify(session);
+        const result = await instagrapiLogin(update.username || "", update.igPassword);
+        if (!result.success) throw new Error(result.error);
+        update.igUserId = result.userId || "";
+        update.sessionData = result.sessionData || "";
         update.sessionSavedAt = new Date();
       } catch (e) {
         return res.status(400).json({ error: `Instagram login failed: ${e.message}` });
@@ -629,7 +631,7 @@ function buildCaption(video, account) {
   return caption.trim().slice(0, 2200);
 }
 
-// ── POST TO INSTAGRAM via instagram-private-api ───────────────────────────────
+// ── POST TO INSTAGRAM via Python Instagrapi ───────────────────────────────────
 async function postToInstagram(videoId) {
   const video = await Video.findById(videoId).populate("accountId");
   if (!video?.accountId) return;
@@ -658,39 +660,38 @@ async function postToInstagram(videoId) {
     }
 
     const caption = buildCaption(video, account);
+    const escapedCaption = caption.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n");
+    const escapedSession = account.sessionData.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const escapedPath = videoPath.replace(/\\/g, "/");
 
-    // Login with saved session
-    const ig = new IgApiClient();
-    ig.state.generateDevice(account.username);
-    await ig.state.deserialize(account.sessionData);
+    const script = `
+import sys, json
+try:
+    from instagrapi import Client
+    cl = Client()
+    cl.delay_range = [1, 3]
+    settings = json.loads(r'''${escapedSession}''')
+    cl.set_settings(settings)
+    cl.get_timeline_feed()
+    media = cl.clip_upload('${escapedPath}', caption='${escapedCaption}')
+    new_session = json.dumps(cl.get_settings())
+    print(json.dumps({"success": True, "mediaId": str(media.pk), "sessionData": new_session}))
+except Exception as e:
+    print(json.dumps({"success": False, "error": str(e)}))
+`;
 
-    // Validate session — if expired, we need a password re-login
-    let sessionValid = false;
-    try {
-      await ig.account.currentUser();
-      sessionValid = true;
-    } catch {
-      // Session expired — mark account as error so user reconnects
-      await Account.findByIdAndUpdate(account._id, { status: "error" });
-      throw new Error("Instagram session expired — please reconnect your account in settings");
-    }
-
-    if (!sessionValid) throw new Error("Session invalid");
-
-    // Post as a Reel (video clip)
-    const publishResult = await ig.publish.video({
-      video: fs.readFileSync(videoPath),
-      coverImage: await generateThumbnail(videoPath),
-      caption,
-    });
-
-    const mediaId = publishResult?.media?.id || publishResult?.uploadId || "unknown";
+    const result = await runPython(script);
+    if (!result.success) throw new Error(result.error);
 
     // Save updated session
-    const newSession = await ig.state.serialize();
+    if (result.sessionData) {
+      await Account.findByIdAndUpdate(account._id, {
+        sessionData: result.sessionData,
+        sessionSavedAt: new Date(),
+      });
+    }
+
     await Account.findByIdAndUpdate(account._id, {
-      sessionData: JSON.stringify(newSession),
-      sessionSavedAt: new Date(),
       $inc: { totalPosted: 1 },
       lastPostedAt: new Date(),
       status: "active",
@@ -699,52 +700,36 @@ async function postToInstagram(videoId) {
     await Video.findByIdAndUpdate(videoId, {
       status: "posted",
       postedAt: new Date(),
-      igPostId: mediaId,
+      igPostId: result.mediaId || "",
       error: "",
     });
 
     await User.findByIdAndUpdate(account.userId, { $inc: { videosPublished: 1 } });
     if (video.workflowId) await Workflow.findByIdAndUpdate(video.workflowId, { $inc: { videosProcessed: 1 } });
     await logActivity(account.userId, account._id, account.username, "posted", `✅ Posted reel to @${account.username}`);
-    console.log(`🎉 Posted to @${account.username} — mediaId: ${mediaId}`);
+    console.log(`🎉 Posted to @${account.username}`);
 
     if (account.autoRequeue) {
       await Video.findByIdAndUpdate(videoId, { status: "downloaded", postedAt: null, igPostId: null });
     }
 
-    // Clean up temp download file
     if (videoPath.includes("post_")) fs.unlink(videoPath, () => {});
 
   } catch (e) {
     console.error(`❌ Post failed @${account.username}: ${e.message}`);
-
-    // Auto-retry up to 2 times (unless session expired)
     const v2 = await Video.findById(videoId);
-    const isSessionError = e.message.includes("session") || e.message.includes("login");
+    const isSessionError = e.message.includes("session") || e.message.includes("login") || e.message.includes("LoginRequired");
     if (v2 && v2.retryCount < 2 && !isSessionError) {
       await Video.findByIdAndUpdate(videoId, { status: "downloaded", $inc: { retryCount: 1 } });
-      setTimeout(() => postToInstagram(videoId), 120000); // retry after 2 min
+      setTimeout(() => postToInstagram(videoId), 120000);
       return;
     }
-
     await Video.findByIdAndUpdate(videoId, { status: "failed", error: e.message });
-    if (!isSessionError) {
+    if (isSessionError) {
       await Account.findByIdAndUpdate(account._id, { status: "error" });
     }
     await logActivity(account.userId, account._id, account.username, "failed", `❌ Post failed @${account.username}: ${e.message}`);
   }
-}
-
-// Generate a simple thumbnail from video (black frame fallback)
-async function generateThumbnail(videoPath) {
-  // Use a 1x1 black pixel as fallback thumbnail
-  // Instagram-private-api needs a cover image buffer
-  const { Buffer } = require("buffer");
-  // Minimal valid JPEG (1x1 black pixel)
-  return Buffer.from(
-    "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AJQAB/9k=",
-    "base64"
-  );
 }
 
 // ── SCHEDULER ─────────────────────────────────────────────────────────────────
