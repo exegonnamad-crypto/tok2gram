@@ -1,11 +1,9 @@
 {
-  "name": "reelflow-backend",
+  "name": "tok2gram-backend",
   "version": "5.0.0",
-  "description": "ReelFlow backend with instagram-private-api",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "axios": "^1.6.0",
@@ -17,8 +15,5 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.0.3",
     "node-cron": "^3.0.3"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
