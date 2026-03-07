@@ -204,11 +204,11 @@ app.get("/api/oauth/instagram/url", auth, async (req, res) => {
     const params = new URLSearchParams({
       client_id: process.env.META_APP_ID,
       redirect_uri: process.env.META_REDIRECT_URI,
-      scope: "instagram_basic,instagram_content_publish,pages_read_engagement",
+      scope: "instagram_business_basic,instagram_content_publish",
       response_type: "code",
       state,
     });
-    res.json({ url: `https://www.facebook.com/v18.0/dialog/oauth?${params}` });
+    res.json({ url: `https://www.instagram.com/oauth/authorize?${params}` });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -220,49 +220,40 @@ app.get("/api/oauth/instagram/callback", async (req, res) => {
     const oauthState = await OAuthState.findOne({ state });
     if (!oauthState) return res.redirect(`${frontendUrl}/?error=invalid_state`);
 
-    const tokenRes = await axios.get("https://graph.facebook.com/v18.0/oauth/access_token", {
-      params: {
+    // Exchange code for short-lived token (Instagram Business Login)
+    const tokenRes = await axios.post("https://api.instagram.com/oauth/access_token",
+      new URLSearchParams({
         client_id: process.env.META_APP_ID,
         client_secret: process.env.META_APP_SECRET,
+        grant_type: "authorization_code",
         redirect_uri: process.env.META_REDIRECT_URI,
         code,
-      },
-    });
+      }),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
 
-    const longTokenRes = await axios.get("https://graph.facebook.com/v18.0/oauth/access_token", {
+    const shortToken = tokenRes.data.access_token;
+    const igUserId = String(tokenRes.data.user_id);
+
+    // Exchange for long-lived token (60 days)
+    const longTokenRes = await axios.get("https://graph.instagram.com/access_token", {
       params: {
-        grant_type: "fb_exchange_token",
-        client_id: process.env.META_APP_ID,
+        grant_type: "ig_exchange_token",
         client_secret: process.env.META_APP_SECRET,
-        fb_exchange_token: tokenRes.data.access_token,
+        access_token: shortToken,
       },
     });
 
     const longToken = longTokenRes.data.access_token;
     const expiresIn = longTokenRes.data.expires_in || 5184000;
 
-    const pagesRes = await axios.get("https://graph.facebook.com/v18.0/me/accounts", {
-      params: { access_token: longToken },
+    // Get Instagram account info
+    const igInfoRes = await axios.get(`https://graph.instagram.com/v18.0/${igUserId}`, {
+      params: { fields: "id,username,profile_picture_url", access_token: longToken },
     });
 
-    let igAccount = null;
-    for (const page of (pagesRes.data?.data || [])) {
-      try {
-        const igRes = await axios.get(`https://graph.facebook.com/v18.0/${page.id}`, {
-          params: { fields: "instagram_business_account", access_token: page.access_token },
-        });
-        if (igRes.data?.instagram_business_account?.id) {
-          const igId = igRes.data.instagram_business_account.id;
-          const igInfo = await axios.get(`https://graph.facebook.com/v18.0/${igId}`, {
-            params: { fields: "id,username,profile_picture_url", access_token: longToken },
-          });
-          igAccount = igInfo.data;
-          break;
-        }
-      } catch {}
-    }
-
-    if (!igAccount) return res.redirect(`${frontendUrl}/?error=no_instagram`);
+    const igAccount = igInfoRes.data;
+    if (!igAccount?.id) return res.redirect(`${frontendUrl}/?error=no_instagram`);
 
     const existing = await Account.findOne({ userId: oauthState.userId, igUserId: igAccount.id });
     if (existing) {
