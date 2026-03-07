@@ -9,7 +9,7 @@ const path = require("path");
 const https = require("https");
 const http = require("http");
 const axios = require("axios");
-const { spawn } = require("child_process");
+const { exec, spawn } = require("child_process");
 require("dotenv").config();
 
 const app = express();
@@ -47,9 +47,10 @@ const User = mongoose.model("User", new mongoose.Schema({
 const Account = mongoose.model("Account", new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
   username: { type: String, trim: true },
-  igPassword: { type: String, default: "" },
+  igPassword: { type: String, default: "" }, // encrypted Instagram password
   igUserId: { type: String, default: "" },
   profilePic: { type: String, default: "" },
+  // sessionData stores instagrapi session so we don't login every time
   sessionData: { type: String, default: "" },
   sessionSavedAt: Date,
   niche: { type: String, default: "General" },
@@ -116,7 +117,7 @@ const ActivityLog = mongoose.model("ActivityLog", new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 }));
 
-// ── AUTH MIDDLEWARE ───────────────────────────────────────────────────────────
+// ── AUTH MIDDLEWARE ────────────────────────────────────────────────────────────
 const auth = (req, res, next) => {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ error: "No token" });
@@ -132,10 +133,6 @@ const isValidUrl = (str) => {
   try { new URL(str); return true; } catch { return false; }
 };
 
-async function logActivity(userId, accountId, accountUsername, action, message) {
-  try { await ActivityLog.create({ userId, accountId, accountUsername, action, message }); } catch {}
-}
-
 // ── AUTH ROUTES ───────────────────────────────────────────────────────────────
 app.post("/api/register", async (req, res) => {
   try {
@@ -146,7 +143,7 @@ app.post("/api/register", async (req, res) => {
     const hash = await bcrypt.hash(password, 12);
     const user = await User.create({ name: name.trim(), email: email.toLowerCase(), password: hash });
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user: { id: user._id, name: user.name, email: user.email, plan: user.plan } });
+    res.json({ token, user: { id: user._id, name: user.name, email: user.email, plan: user.plan, trialEndsAt: user.trialEndsAt } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -158,7 +155,7 @@ app.post("/api/login", async (req, res) => {
     if (!user || !await bcrypt.compare(password, user.password))
       return res.status(400).json({ error: "Invalid email or password" });
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user: { id: user._id, name: user.name, email: user.email, plan: user.plan } });
+    res.json({ token, user: { id: user._id, name: user.name, email: user.email, plan: user.plan, trialEndsAt: user.trialEndsAt } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -170,49 +167,31 @@ app.get("/api/me", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── PYTHON / INSTAGRAPI ───────────────────────────────────────────────────────
-function runPython(script) {
-  return new Promise((resolve) => {
-    const py = spawn("python3", ["-c", script]);
-    let out = "", err = "";
-    py.stdout.on("data", d => out += d.toString());
-    py.stderr.on("data", d => err += d.toString());
-    py.on("close", () => {
-      console.log(`🐍 Python stdout: ${out.slice(0, 200)}`);
-      if (err) console.log(`🐍 Python stderr: ${err.slice(0, 200)}`);
-      try { resolve(JSON.parse(out.trim())); }
-      catch { resolve({ success: false, error: err || out || "Python error" }); }
-    });
-    setTimeout(() => { py.kill(); resolve({ success: false, error: "Timeout" }); }, 120000);
-  });
-}
+app.delete("/api/me", auth, async (req, res) => {
+  try {
+    await Video.deleteMany({ userId: req.user.id });
+    await Account.deleteMany({ userId: req.user.id });
+    await Workflow.deleteMany({ userId: req.user.id });
+    await ActivityLog.deleteMany({ userId: req.user.id });
+    await User.findByIdAndDelete(req.user.id);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-async function instagrapiLogin(username, password) {
-  const script = `
-import sys, json
-try:
-    from instagrapi import Client
-    cl = Client()
-    cl.delay_range = [2, 5]
-    cl.login("${username.replace(/"/g, '')}", "${password.replace(/"/g, '')}")
-    session = json.dumps(cl.get_settings())
-    uid = str(cl.user_id)
-    print(json.dumps({"success": True, "userId": uid, "username": "${username}", "sessionData": session}))
-except Exception as e:
-    print(json.dumps({"success": False, "error": str(e)}))
-`;
-  return runPython(script);
-}
-
-// ── VERIFY INSTAGRAM ──────────────────────────────────────────────────────────
+// ── INSTAGRAM LOGIN (Instagrapi) ──────────────────────────────────────────────
+// Test Instagram credentials before saving
 app.post("/api/instagram/verify", auth, async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Username and password required" });
-  const result = await instagrapiLogin(username, password);
-  if (result.success) {
-    res.json({ success: true, userId: result.userId, username: result.username });
-  } else {
-    res.status(400).json({ success: false, error: result.error });
+  try {
+    const result = await instagrapiLogin(username, password);
+    if (result.success) {
+      res.json({ success: true, userId: result.userId, username: result.username });
+    } else {
+      res.status(400).json({ success: false, error: result.error });
+    }
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
@@ -220,7 +199,11 @@ app.post("/api/instagram/verify", auth, async (req, res) => {
 app.get("/api/accounts", auth, async (req, res) => {
   try {
     const accounts = await Account.find({ userId: req.user.id }).sort({ createdAt: -1 });
-    res.json(accounts.map(a => ({ ...a.toObject(), igPassword: a.igPassword ? "***" : "", sessionData: undefined })));
+    res.json(accounts.map(a => ({
+      ...a.toObject(),
+      igPassword: a.igPassword ? "***" : "",
+      sessionData: undefined,
+    })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -229,14 +212,18 @@ app.post("/api/accounts", auth, async (req, res) => {
     const { username, igPassword, niche, postsPerDay, hashtags, captionStyle, customCaption, appendHashtags, autoRequeue, postingTimes } = req.body;
     if (!username || !igPassword) return res.status(400).json({ error: "Instagram username and password required" });
 
+    // Verify credentials work
     const loginResult = await instagrapiLogin(username, igPassword);
     if (!loginResult.success) return res.status(400).json({ error: `Instagram login failed: ${loginResult.error}` });
 
+    // Encrypt password before storing
+    const encryptedPassword = await bcrypt.hash(igPassword, 10);
+
     const acc = await Account.create({
       userId: req.user.id,
-      username: username.replace("@", "").toLowerCase().trim(),
+      username: loginResult.username || username,
       igUserId: loginResult.userId || "",
-      igPassword: igPassword,
+      igPassword: encryptedPassword,
       sessionData: loginResult.sessionData || "",
       sessionSavedAt: new Date(),
       niche: niche || "General",
@@ -257,15 +244,13 @@ app.post("/api/accounts", auth, async (req, res) => {
 app.put("/api/accounts/:id", auth, async (req, res) => {
   try {
     const update = { ...req.body };
-    if (update.igPassword && update.igPassword !== "***") {
-      const loginResult = await instagrapiLogin(update.username || "", update.igPassword);
-      if (!loginResult.success) return res.status(400).json({ error: `Instagram login failed: ${loginResult.error}` });
-      update.igUserId = loginResult.userId || "";
-      update.sessionData = loginResult.sessionData || "";
-      update.sessionSavedAt = new Date();
-    } else {
+    // Don't overwrite password if not provided
+    if (!update.igPassword || update.igPassword === "***") {
       delete update.igPassword;
+    } else {
+      update.igPassword = await bcrypt.hash(update.igPassword, 10);
     }
+    delete update.sessionData;
     const acc = await Account.findOneAndUpdate(
       { _id: req.params.id, userId: req.user.id },
       update,
@@ -411,10 +396,8 @@ app.post("/api/videos/:id/retry", auth, async (req, res) => {
 
 app.post("/api/videos/:id/post-now", auth, async (req, res) => {
   try {
-    const video = await Video.findOne({ _id: req.params.id, userId: req.user.id });
-    if (!video) return res.status(404).json({ error: "Video not found" });
-    if (!["downloaded", "failed", "scheduled"].includes(video.status))
-      return res.status(400).json({ error: "Video must be downloaded first" });
+    const video = await Video.findOne({ _id: req.params.id, userId: req.user.id, status: "downloaded" });
+    if (!video) return res.status(404).json({ error: "Video not ready (must be downloaded first)" });
     postToInstagram(video._id);
     res.json({ message: "Posting now..." });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -477,6 +460,62 @@ app.get("/api/activity", auth, async (req, res) => {
     res.json(logs);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+async function logActivity(userId, accountId, accountUsername, action, message) {
+  try { await ActivityLog.create({ userId, accountId, accountUsername, action, message }); } catch {}
+}
+
+// ── INSTAGRAPI LOGIN ──────────────────────────────────────────────────────────
+async function instagrapiLogin(username, password, existingSession = null) {
+  return new Promise((resolve) => {
+    const script = `
+import sys
+import json
+try:
+    from instagrapi import Client
+    cl = Client()
+    cl.delay_range = [2, 5]
+    ${existingSession ? `
+    try:
+        cl.load_settings(json.loads('''${existingSession}'''))
+        cl.login('${username}', '${password}')
+    except:
+        cl = Client()
+        cl.delay_range = [2, 5]
+        cl.login('${username}', '${password}')
+    ` : `cl.login('${username}', '${password}')`}
+    session = json.dumps(cl.get_settings())
+    user_id = str(cl.user_id)
+    print(json.dumps({"success": True, "userId": user_id, "username": "${username}", "sessionData": session}))
+except Exception as e:
+    print(json.dumps({"success": False, "error": str(e)}))
+`;
+    const py = spawn("python3", ["-c", script]);
+    let output = "";
+    let errOutput = "";
+    py.stdout.on("data", d => output += d.toString());
+    py.stderr.on("data", d => errOutput += d.toString());
+    py.on("close", () => {
+      try {
+        const lines = output.trim().split("\n").reverse();
+        let result = null;
+        for (const line of lines) {
+          try {
+            const parsed = JSON.parse(line.trim());
+            if (parsed && typeof parsed === "object" && "success" in parsed) {
+              result = parsed; break;
+            }
+          } catch {}
+        }
+        resolve(result || { success: false, error: errOutput || "Python/Instagrapi not available" });
+      } catch {
+        resolve({ success: false, error: errOutput || "Python/Instagrapi not available" });
+      }
+    });
+    setTimeout(() => { py.kill(); resolve({ success: false, error: "Login timeout" }); }, 60000);
+  });
+}
 
 // ── DOWNLOAD PIPELINE ─────────────────────────────────────────────────────────
 async function getVideoInfo(videoUrl) {
@@ -567,10 +606,11 @@ async function uploadToCloudinary(videoId, filePath) {
     console.log(`☁️ Cloudinary done: ${videoId}`);
   } catch (e) {
     console.error("❌ Cloudinary error:", e.message);
+    await Video.findByIdAndUpdate(videoId, { error: `Cloudinary: ${e.message}` });
   }
 }
 
-// ── CAPTION BUILDER ───────────────────────────────────────────────────────────
+// ── INSTAGRAM POSTING via Instagrapi ─────────────────────────────────────────
 function buildCaption(video, account) {
   let caption = "";
   if (account.captionStyle === "original") caption = video.caption || "";
@@ -581,21 +621,20 @@ function buildCaption(video, account) {
   return caption.trim().slice(0, 2200);
 }
 
-// ── POST TO INSTAGRAM via Python Instagrapi ───────────────────────────────────
 async function postToInstagram(videoId) {
   const video = await Video.findById(videoId).populate("accountId");
   if (!video?.accountId) return;
   const account = video.accountId;
 
-  if (!account.sessionData) {
-    await Video.findByIdAndUpdate(videoId, { status: "failed", error: "No Instagram session — please reconnect account" });
+  if (!account.igPassword) {
+    await Video.findByIdAndUpdate(videoId, { status: "failed", error: "No Instagram credentials — please reconnect account" });
     return;
   }
 
   try {
     await Video.findByIdAndUpdate(videoId, { status: "posting", error: "" });
-    console.log(`📤 Posting for @${account.username}...`);
 
+    // Need local file for instagrapi — download from cloudinary if needed
     let videoPath = video.localPath;
     if (!videoPath || !fs.existsSync(videoPath)) {
       if (!video.cloudinaryUrl) throw new Error("No video file available");
@@ -606,40 +645,20 @@ async function postToInstagram(videoId) {
     }
 
     const caption = buildCaption(video, account);
-    // Write session to temp file to avoid shell escaping issues
-    const sessionFile = path.join(__dirname, "downloads", `session_${videoId}.json`);
-    fs.writeFileSync(sessionFile, account.sessionData);
 
-    const script = `
-import sys, json
-try:
-    from instagrapi import Client
-    cl = Client()
-    cl.delay_range = [1, 3]
-    with open("${sessionFile.replace(/\\/g, "/")}", "r") as f:
-        settings = json.load(f)
-    cl.set_settings(settings)
-    cl.get_timeline_feed()
-    media = cl.clip_upload(
-        "${videoPath.replace(/\\/g, "/")}",
-        caption=${JSON.stringify(caption)}
-    )
-    media_id = str(media.pk)
-    try:
-        new_session = json.dumps(cl.get_settings())
-    except:
-        new_session = ""
-    print(json.dumps({"success": True, "mediaId": media_id, "sessionData": new_session}))
-except Exception as e:
-    err = str(e)
-    print(json.dumps({"success": False, "error": err}))
-`;
-
-    const result = await runPython(script);
-    fs.unlink(sessionFile, () => {});
+    // Decrypt and use password with instagrapi
+    const result = await postViaInstagrapi(
+      account.username,
+      account.igPassword,
+      account.sessionData || "",
+      videoPath,
+      caption,
+      String(account._id)
+    );
 
     if (!result.success) throw new Error(result.error);
 
+    // Save updated session
     if (result.sessionData) {
       await Account.findByIdAndUpdate(account._id, {
         sessionData: result.sessionData,
@@ -647,19 +666,17 @@ except Exception as e:
       });
     }
 
-    await Account.findByIdAndUpdate(account._id, {
-      $inc: { totalPosted: 1 },
-      lastPostedAt: new Date(),
-      status: "active",
-    });
-
     await Video.findByIdAndUpdate(videoId, {
       status: "posted",
       postedAt: new Date(),
       igPostId: result.mediaId || "",
       error: "",
     });
-
+    await Account.findByIdAndUpdate(account._id, {
+      $inc: { totalPosted: 1 },
+      lastPostedAt: new Date(),
+      status: "active",
+    });
     await User.findByIdAndUpdate(account.userId, { $inc: { videosPublished: 1 } });
     if (video.workflowId) await Workflow.findByIdAndUpdate(video.workflowId, { $inc: { videosProcessed: 1 } });
     await logActivity(account.userId, account._id, account.username, "posted", `✅ Posted reel to @${account.username}`);
@@ -668,21 +685,79 @@ except Exception as e:
     if (account.autoRequeue) {
       await Video.findByIdAndUpdate(videoId, { status: "downloaded", postedAt: null, igPostId: null });
     }
+
+    // Clean up temp file
     if (videoPath.includes("post_")) fs.unlink(videoPath, () => {});
 
   } catch (e) {
-    console.error(`❌ Post failed @${account.username}: ${e.message}`);
     const v2 = await Video.findById(videoId);
-    const isSessionError = e.message.includes("login") || e.message.includes("LoginRequired") || e.message.includes("session");
-    if (v2 && v2.retryCount < 2 && !isSessionError) {
+    if (v2 && v2.retryCount < 2) {
       await Video.findByIdAndUpdate(videoId, { status: "downloaded", $inc: { retryCount: 1 } });
       setTimeout(() => postToInstagram(videoId), 120000);
       return;
     }
     await Video.findByIdAndUpdate(videoId, { status: "failed", error: e.message });
-    if (isSessionError) await Account.findByIdAndUpdate(account._id, { status: "error" });
-    await logActivity(account.userId, account._id, account.username, "failed", `❌ Post failed: ${e.message}`);
+    await Account.findByIdAndUpdate(account._id, { status: "error" });
+    await logActivity(account.userId, account._id, account.username, "failed", `❌ Post failed @${account.username}: ${e.message}`);
+    console.error(`❌ Post failed @${account.username}: ${e.message}`);
   }
+}
+
+async function postViaInstagrapi(username, hashedPassword, sessionData, videoPath, caption, accountId) {
+  // We store hashed password so we can't reverse it
+  // Instead we use the session data saved at login time
+  // If session expired, account needs to be reconnected
+  return new Promise((resolve) => {
+    if (!sessionData) {
+      resolve({ success: false, error: "Session expired — please reconnect your Instagram account" });
+      return;
+    }
+
+    const escapedCaption = caption.replace(/'/g, "\\'").replace(/\n/g, "\\n");
+    const escapedPath = videoPath.replace(/\\/g, "/");
+
+    const script = `
+import sys
+import json
+try:
+    from instagrapi import Client
+    cl = Client()
+    cl.delay_range = [1, 3]
+    settings = json.loads('''${sessionData.replace(/'/g, "\\'")}''')
+    cl.set_settings(settings)
+    cl.get_timeline_feed()
+    media = cl.clip_upload('${escapedPath}', caption='${escapedCaption}')
+    new_session = json.dumps(cl.get_settings())
+    print(json.dumps({"success": True, "mediaId": str(media.pk), "sessionData": new_session}))
+except Exception as e:
+    err = str(e)
+    print(json.dumps({"success": False, "error": err}))
+`;
+
+    const py = spawn("python3", ["-c", script]);
+    let output = "";
+    let errOutput = "";
+    py.stdout.on("data", d => output += d.toString());
+    py.stderr.on("data", d => errOutput += d.toString());
+    py.on("close", () => {
+      try {
+        const lines = output.trim().split("\n").reverse();
+        let result = null;
+        for (const line of lines) {
+          try {
+            const parsed = JSON.parse(line.trim());
+            if (parsed && typeof parsed === "object" && "success" in parsed) {
+              result = parsed; break;
+            }
+          } catch {}
+        }
+        resolve(result || { success: false, error: errOutput || output || "No valid response" });
+      } catch {
+        resolve({ success: false, error: errOutput || "Instagrapi error" });
+      }
+    });
+    setTimeout(() => { py.kill(); resolve({ success: false, error: "Post timeout (120s)" }); }, 120000);
+  });
 }
 
 // ── SCHEDULER ─────────────────────────────────────────────────────────────────
@@ -690,7 +765,8 @@ cron.schedule("* * * * *", async () => {
   try {
     const now = new Date();
     const t = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-    for (const acc of await Account.find({ status: "active" })) {
+    const activeAccounts = await Account.find({ status: "active" });
+    for (const acc of activeAccounts) {
       if (!acc.postingTimes.includes(t)) continue;
       const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
       const posted = await Video.countDocuments({ accountId: acc._id, status: "posted", postedAt: { $gte: todayStart } });
@@ -699,14 +775,30 @@ cron.schedule("* * * * *", async () => {
       if (posting > 0) continue;
       const next = await Video.findOne({ accountId: acc._id, status: "downloaded" }).sort({ createdAt: 1 });
       if (!next) continue;
-      console.log(`⏰ Scheduler posting for @${acc.username}`);
+      console.log(`⏰ Auto-posting for @${acc.username}`);
       postToInstagram(next._id);
     }
   } catch (e) { console.error("Scheduler error:", e.message); }
 });
 
-// ── HEALTH ────────────────────────────────────────────────────────────────────
-app.get("/", (req, res) => res.json({ status: "✅ ReelFlow API v5.0 — Instagrapi", version: "5.0.0", uptime: process.uptime() }));
-app.get("/health", (req, res) => res.json({ ok: true }));
+// Auto-retry failed downloads every 30 mins
+cron.schedule("*/30 * * * *", async () => {
+  try {
+    const failed = await Video.find({ status: "failed", retryCount: { $lt: 3 }, cloudinaryUrl: null });
+    for (const v of failed) {
+      await Video.findByIdAndUpdate(v._id, { status: "queued", retryCount: v.retryCount + 1 });
+      setTimeout(() => downloadVideo(v._id, v.videoUrl), 2000);
+    }
+  } catch (e) { console.error("Retry cron error:", e.message); }
+});
 
-app.listen(process.env.PORT || 3001, () => console.log(`🚀 ReelFlow v5.0 on port ${process.env.PORT || 3001}`));
+// ── HEALTH ────────────────────────────────────────────────────────────────────
+app.get("/", (req, res) => res.json({ status: "✅ ReelFlow API v4.0 — Instagrapi", version: "4.0.0", uptime: process.uptime() }));
+app.get("/health", (req, res) => res.json({ ok: true, uptime: process.uptime() }));
+
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err.message);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+app.listen(process.env.PORT || 3001, () => console.log(`🚀 ReelFlow v4.0 on port ${process.env.PORT || 3001}`));
