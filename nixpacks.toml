@@ -1,8 +1,11 @@
 [phases.setup]
-nixPkgs = ["python3", "ffmpeg"]
+nixPkgs = ["nodejs", "python311", "python311Packages.pip"]
 
-[phases.build]
-cmds = ["npm install"]
+[phases.install]
+cmds = [
+  "npm install",
+  "pip install instagrapi --break-system-packages || pip3 install instagrapi"
+]
 
-[phases.start]
+[start]
 cmd = "node server.js"
