@@ -9,7 +9,7 @@ const path = require("path");
 const https = require("https");
 const http = require("http");
 const axios = require("axios");
-const { exec, spawn } = require("child_process");
+const { IgApiClient } = require("instagram-private-api");
 require("dotenv").config();
 
 const app = express();
@@ -47,10 +47,9 @@ const User = mongoose.model("User", new mongoose.Schema({
 const Account = mongoose.model("Account", new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
   username: { type: String, trim: true },
-  igPassword: { type: String, default: "" }, // encrypted Instagram password
+  igPassword: { type: String, default: "" },
   igUserId: { type: String, default: "" },
   profilePic: { type: String, default: "" },
-  // sessionData stores instagrapi session so we don't login every time
   sessionData: { type: String, default: "" },
   sessionSavedAt: Date,
   niche: { type: String, default: "General" },
@@ -178,20 +177,54 @@ app.delete("/api/me", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── INSTAGRAM LOGIN (Instagrapi) ──────────────────────────────────────────────
-// Test Instagram credentials before saving
+// ── INSTAGRAM LOGIN HELPER (instagram-private-api) ───────────────────────────
+async function igLogin(username, password, existingSession = null) {
+  const ig = new IgApiClient();
+  ig.state.generateDevice(username);
+
+  if (existingSession) {
+    try {
+      await ig.state.deserialize(existingSession);
+      // Quick check to verify session is still valid
+      await ig.account.currentUser();
+      console.log(`✅ Session reused for @${username}`);
+      return { ig, fresh: false };
+    } catch {
+      console.log(`🔄 Session expired for @${username}, re-logging in...`);
+    }
+  }
+
+  await ig.simulate.preLoginFlow();
+  await ig.account.login(username, password);
+  await ig.simulate.postLoginFlow();
+  console.log(`✅ Logged in to @${username}`);
+  return { ig, fresh: true };
+}
+
+// ── VERIFY INSTAGRAM CREDENTIALS ──────────────────────────────────────────────
 app.post("/api/instagram/verify", auth, async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Username and password required" });
   try {
-    const result = await instagrapiLogin(username, password);
-    if (result.success) {
-      res.json({ success: true, userId: result.userId, username: result.username });
-    } else {
-      res.status(400).json({ success: false, error: result.error });
-    }
+    const { ig } = await igLogin(username, password);
+    const user = await ig.account.currentUser();
+    const session = await ig.state.serialize();
+    res.json({
+      success: true,
+      userId: user.pk.toString(),
+      username: user.username,
+      profilePic: user.profile_pic_url,
+      session: JSON.stringify(session),
+    });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    const msg = e.message || "";
+    if (msg.includes("checkpoint")) {
+      res.status(400).json({ success: false, error: "Instagram requires verification (check your email/SMS for a code)" });
+    } else if (msg.includes("bad_password") || msg.includes("invalid_credentials")) {
+      res.status(400).json({ success: false, error: "Wrong username or password" });
+    } else {
+      res.status(400).json({ success: false, error: `Login failed: ${msg}` });
+    }
   }
 });
 
@@ -212,19 +245,32 @@ app.post("/api/accounts", auth, async (req, res) => {
     const { username, igPassword, niche, postsPerDay, hashtags, captionStyle, customCaption, appendHashtags, autoRequeue, postingTimes } = req.body;
     if (!username || !igPassword) return res.status(400).json({ error: "Instagram username and password required" });
 
-    // Verify credentials work
-    const loginResult = await instagrapiLogin(username, igPassword);
-    if (!loginResult.success) return res.status(400).json({ error: `Instagram login failed: ${loginResult.error}` });
+    // Test the credentials and get session
+    let igUserId = "", sessionData = "", profilePic = "";
+    try {
+      const { ig } = await igLogin(username, igPassword);
+      const user = await ig.account.currentUser();
+      igUserId = user.pk.toString();
+      profilePic = user.profile_pic_url || "";
+      const session = await ig.state.serialize();
+      sessionData = JSON.stringify(session);
+    } catch (e) {
+      const msg = e.message || "";
+      if (msg.includes("checkpoint")) {
+        return res.status(400).json({ error: "Instagram requires email/SMS verification. Please log in manually on Instagram first, then try again." });
+      }
+      return res.status(400).json({ error: `Instagram login failed: ${msg}` });
+    }
 
-    // Encrypt password before storing
     const encryptedPassword = await bcrypt.hash(igPassword, 10);
 
     const acc = await Account.create({
       userId: req.user.id,
-      username: loginResult.username || username,
-      igUserId: loginResult.userId || "",
+      username: username.replace("@", "").toLowerCase(),
+      igUserId,
       igPassword: encryptedPassword,
-      sessionData: loginResult.sessionData || "",
+      profilePic,
+      sessionData,
       sessionSavedAt: new Date(),
       niche: niche || "General",
       postsPerDay: postsPerDay || 5,
@@ -244,13 +290,23 @@ app.post("/api/accounts", auth, async (req, res) => {
 app.put("/api/accounts/:id", auth, async (req, res) => {
   try {
     const update = { ...req.body };
-    // Don't overwrite password if not provided
     if (!update.igPassword || update.igPassword === "***") {
       delete update.igPassword;
     } else {
+      // New password provided - re-login and get fresh session
+      try {
+        const { ig } = await igLogin(update.username || "", update.igPassword);
+        const user = await ig.account.currentUser();
+        update.igUserId = user.pk.toString();
+        update.profilePic = user.profile_pic_url || "";
+        const session = await ig.state.serialize();
+        update.sessionData = JSON.stringify(session);
+        update.sessionSavedAt = new Date();
+      } catch (e) {
+        return res.status(400).json({ error: `Instagram login failed: ${e.message}` });
+      }
       update.igPassword = await bcrypt.hash(update.igPassword, 10);
     }
-    delete update.sessionData;
     const acc = await Account.findOneAndUpdate(
       { _id: req.params.id, userId: req.user.id },
       update,
@@ -396,8 +452,11 @@ app.post("/api/videos/:id/retry", auth, async (req, res) => {
 
 app.post("/api/videos/:id/post-now", auth, async (req, res) => {
   try {
-    const video = await Video.findOne({ _id: req.params.id, userId: req.user.id, status: "downloaded" });
-    if (!video) return res.status(404).json({ error: "Video not ready (must be downloaded first)" });
+    const video = await Video.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!video) return res.status(404).json({ error: "Video not found" });
+    if (!["downloaded", "failed"].includes(video.status)) {
+      return res.status(400).json({ error: "Video must be downloaded first" });
+    }
     postToInstagram(video._id);
     res.json({ message: "Posting now..." });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -464,48 +523,6 @@ app.get("/api/activity", auth, async (req, res) => {
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 async function logActivity(userId, accountId, accountUsername, action, message) {
   try { await ActivityLog.create({ userId, accountId, accountUsername, action, message }); } catch {}
-}
-
-// ── INSTAGRAPI LOGIN ──────────────────────────────────────────────────────────
-async function instagrapiLogin(username, password, existingSession = null) {
-  return new Promise((resolve) => {
-    const script = `
-import sys
-import json
-try:
-    from instagrapi import Client
-    cl = Client()
-    cl.delay_range = [2, 5]
-    ${existingSession ? `
-    try:
-        cl.load_settings(json.loads('''${existingSession}'''))
-        cl.login('${username}', '${password}')
-    except:
-        cl = Client()
-        cl.delay_range = [2, 5]
-        cl.login('${username}', '${password}')
-    ` : `cl.login('${username}', '${password}')`}
-    session = json.dumps(cl.get_settings())
-    user_id = str(cl.user_id)
-    print(json.dumps({"success": True, "userId": user_id, "username": "${username}", "sessionData": session}))
-except Exception as e:
-    print(json.dumps({"success": False, "error": str(e)}))
-`;
-    const py = spawn("python3", ["-c", script]);
-    let output = "";
-    let errOutput = "";
-    py.stdout.on("data", d => output += d.toString());
-    py.stderr.on("data", d => errOutput += d.toString());
-    py.on("close", () => {
-      try {
-        const result = JSON.parse(output.trim());
-        resolve(result);
-      } catch {
-        resolve({ success: false, error: errOutput || "Python/Instagrapi not available" });
-      }
-    });
-    setTimeout(() => { py.kill(); resolve({ success: false, error: "Login timeout" }); }, 60000);
-  });
 }
 
 // ── DOWNLOAD PIPELINE ─────────────────────────────────────────────────────────
@@ -601,7 +618,7 @@ async function uploadToCloudinary(videoId, filePath) {
   }
 }
 
-// ── INSTAGRAM POSTING via Instagrapi ─────────────────────────────────────────
+// ── BUILD CAPTION ─────────────────────────────────────────────────────────────
 function buildCaption(video, account) {
   let caption = "";
   if (account.captionStyle === "original") caption = video.caption || "";
@@ -612,20 +629,25 @@ function buildCaption(video, account) {
   return caption.trim().slice(0, 2200);
 }
 
+// ── POST TO INSTAGRAM via instagram-private-api ───────────────────────────────
 async function postToInstagram(videoId) {
   const video = await Video.findById(videoId).populate("accountId");
   if (!video?.accountId) return;
   const account = video.accountId;
 
-  if (!account.igPassword) {
-    await Video.findByIdAndUpdate(videoId, { status: "failed", error: "No Instagram credentials — please reconnect account" });
+  if (!account.sessionData) {
+    await Video.findByIdAndUpdate(videoId, {
+      status: "failed",
+      error: "No Instagram session — please reconnect your account",
+    });
     return;
   }
 
   try {
     await Video.findByIdAndUpdate(videoId, { status: "posting", error: "" });
+    console.log(`📤 Posting for @${account.username}...`);
 
-    // Need local file for instagrapi — download from cloudinary if needed
+    // Get local video file
     let videoPath = video.localPath;
     if (!videoPath || !fs.existsSync(videoPath)) {
       if (!video.cloudinaryUrl) throw new Error("No video file available");
@@ -637,109 +659,92 @@ async function postToInstagram(videoId) {
 
     const caption = buildCaption(video, account);
 
-    // Decrypt and use password with instagrapi
-    const result = await postViaInstagrapi(
-      account.username,
-      account.igPassword,
-      account.sessionData || "",
-      videoPath,
-      caption,
-      String(account._id)
-    );
+    // Login with saved session
+    const ig = new IgApiClient();
+    ig.state.generateDevice(account.username);
+    await ig.state.deserialize(account.sessionData);
 
-    if (!result.success) throw new Error(result.error);
-
-    // Save updated session
-    if (result.sessionData) {
-      await Account.findByIdAndUpdate(account._id, {
-        sessionData: result.sessionData,
-        sessionSavedAt: new Date(),
-      });
+    // Validate session — if expired, we need a password re-login
+    let sessionValid = false;
+    try {
+      await ig.account.currentUser();
+      sessionValid = true;
+    } catch {
+      // Session expired — mark account as error so user reconnects
+      await Account.findByIdAndUpdate(account._id, { status: "error" });
+      throw new Error("Instagram session expired — please reconnect your account in settings");
     }
 
-    await Video.findByIdAndUpdate(videoId, {
-      status: "posted",
-      postedAt: new Date(),
-      igPostId: result.mediaId || "",
-      error: "",
+    if (!sessionValid) throw new Error("Session invalid");
+
+    // Post as a Reel (video clip)
+    const publishResult = await ig.publish.video({
+      video: fs.readFileSync(videoPath),
+      coverImage: await generateThumbnail(videoPath),
+      caption,
     });
+
+    const mediaId = publishResult?.media?.id || publishResult?.uploadId || "unknown";
+
+    // Save updated session
+    const newSession = await ig.state.serialize();
     await Account.findByIdAndUpdate(account._id, {
+      sessionData: JSON.stringify(newSession),
+      sessionSavedAt: new Date(),
       $inc: { totalPosted: 1 },
       lastPostedAt: new Date(),
       status: "active",
     });
+
+    await Video.findByIdAndUpdate(videoId, {
+      status: "posted",
+      postedAt: new Date(),
+      igPostId: mediaId,
+      error: "",
+    });
+
     await User.findByIdAndUpdate(account.userId, { $inc: { videosPublished: 1 } });
     if (video.workflowId) await Workflow.findByIdAndUpdate(video.workflowId, { $inc: { videosProcessed: 1 } });
     await logActivity(account.userId, account._id, account.username, "posted", `✅ Posted reel to @${account.username}`);
-    console.log(`🎉 Posted to @${account.username}`);
+    console.log(`🎉 Posted to @${account.username} — mediaId: ${mediaId}`);
 
     if (account.autoRequeue) {
       await Video.findByIdAndUpdate(videoId, { status: "downloaded", postedAt: null, igPostId: null });
     }
 
-    // Clean up temp file
+    // Clean up temp download file
     if (videoPath.includes("post_")) fs.unlink(videoPath, () => {});
 
   } catch (e) {
+    console.error(`❌ Post failed @${account.username}: ${e.message}`);
+
+    // Auto-retry up to 2 times (unless session expired)
     const v2 = await Video.findById(videoId);
-    if (v2 && v2.retryCount < 2) {
+    const isSessionError = e.message.includes("session") || e.message.includes("login");
+    if (v2 && v2.retryCount < 2 && !isSessionError) {
       await Video.findByIdAndUpdate(videoId, { status: "downloaded", $inc: { retryCount: 1 } });
-      setTimeout(() => postToInstagram(videoId), 120000);
+      setTimeout(() => postToInstagram(videoId), 120000); // retry after 2 min
       return;
     }
+
     await Video.findByIdAndUpdate(videoId, { status: "failed", error: e.message });
-    await Account.findByIdAndUpdate(account._id, { status: "error" });
+    if (!isSessionError) {
+      await Account.findByIdAndUpdate(account._id, { status: "error" });
+    }
     await logActivity(account.userId, account._id, account.username, "failed", `❌ Post failed @${account.username}: ${e.message}`);
-    console.error(`❌ Post failed @${account.username}: ${e.message}`);
   }
 }
 
-async function postViaInstagrapi(username, hashedPassword, sessionData, videoPath, caption, accountId) {
-  // We store hashed password so we can't reverse it
-  // Instead we use the session data saved at login time
-  // If session expired, account needs to be reconnected
-  return new Promise((resolve) => {
-    if (!sessionData) {
-      resolve({ success: false, error: "Session expired — please reconnect your Instagram account" });
-      return;
-    }
-
-    const escapedCaption = caption.replace(/'/g, "\\'").replace(/\n/g, "\\n");
-    const escapedPath = videoPath.replace(/\\/g, "/");
-
-    const script = `
-import sys
-import json
-try:
-    from instagrapi import Client
-    cl = Client()
-    cl.delay_range = [1, 3]
-    settings = json.loads('''${sessionData.replace(/'/g, "\\'")}''')
-    cl.set_settings(settings)
-    cl.get_timeline_feed()
-    media = cl.clip_upload('${escapedPath}', caption='${escapedCaption}')
-    new_session = json.dumps(cl.get_settings())
-    print(json.dumps({"success": True, "mediaId": str(media.pk), "sessionData": new_session}))
-except Exception as e:
-    err = str(e)
-    print(json.dumps({"success": False, "error": err}))
-`;
-
-    const py = spawn("python3", ["-c", script]);
-    let output = "";
-    let errOutput = "";
-    py.stdout.on("data", d => output += d.toString());
-    py.stderr.on("data", d => errOutput += d.toString());
-    py.on("close", () => {
-      try {
-        const result = JSON.parse(output.trim());
-        resolve(result);
-      } catch {
-        resolve({ success: false, error: errOutput || "Instagrapi error" });
-      }
-    });
-    setTimeout(() => { py.kill(); resolve({ success: false, error: "Post timeout (120s)" }); }, 120000);
-  });
+// Generate a simple thumbnail from video (black frame fallback)
+async function generateThumbnail(videoPath) {
+  // Use a 1x1 black pixel as fallback thumbnail
+  // Instagram-private-api needs a cover image buffer
+  const { Buffer } = require("buffer");
+  // Minimal valid JPEG (1x1 black pixel)
+  return Buffer.from(
+    "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AJQAB/9k=",
+    "base64"
+  );
 }
 
 // ── SCHEDULER ─────────────────────────────────────────────────────────────────
@@ -775,7 +780,7 @@ cron.schedule("*/30 * * * *", async () => {
 });
 
 // ── HEALTH ────────────────────────────────────────────────────────────────────
-app.get("/", (req, res) => res.json({ status: "✅ ReelFlow API v4.0 — Instagrapi", version: "4.0.0", uptime: process.uptime() }));
+app.get("/", (req, res) => res.json({ status: "✅ ReelFlow API v5.0 — instagram-private-api", version: "5.0.0", uptime: process.uptime() }));
 app.get("/health", (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
 app.use((err, req, res, next) => {
@@ -783,4 +788,4 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
-app.listen(process.env.PORT || 3001, () => console.log(`🚀 ReelFlow v4.0 on port ${process.env.PORT || 3001}`));
+app.listen(process.env.PORT || 3001, () => console.log(`🚀 ReelFlow v5.0 on port ${process.env.PORT || 3001}`));
