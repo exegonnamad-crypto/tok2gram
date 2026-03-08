@@ -211,8 +211,9 @@ app.post("/api/accounts", auth, async (req, res) => {
   try {
     const { username, igPassword, sessionId, niche, postsPerDay, hashtags, captionStyle, customCaption, appendHashtags, autoRequeue, postingTimes } = req.body;
 
-    if (!username) return res.status(400).json({ error: "Instagram username required" });
+    // ✅ FIX: sessionId alone is sufficient — username is fetched from Instagram automatically
     if (!sessionId && !igPassword) return res.status(400).json({ error: "Session cookie or password required" });
+    if (!sessionId && !username) return res.status(400).json({ error: "Instagram username required when using password login" });
 
     let loginResult;
     if (sessionId) {
@@ -225,7 +226,7 @@ app.post("/api/accounts", auth, async (req, res) => {
 
     const acc = await Account.create({
       userId: req.user.id,
-      username: (loginResult.username || username).replace("@", "").toLowerCase().trim(),
+      username: (loginResult.username || username || "").replace("@", "").toLowerCase().trim(),
       igUserId: loginResult.userId || "",
       igPassword: igPassword ? await bcrypt.hash(igPassword, 10) : "",
       sessionData: loginResult.sessionData || "",
