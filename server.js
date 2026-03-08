@@ -287,6 +287,26 @@ function runPython(script) {
   });
 }
 
+async function instagrapiLoginWithCookie(sessionId) {
+  const sid = sessionId.replace(/"/g, '').trim();
+  const script = `
+import sys, json
+try:
+    from instagrapi import Client
+    cl = Client()
+    cl.delay_range = [2, 5]
+    cl.login_by_sessionid("${sid}")
+    session = json.dumps(cl.get_settings())
+    uid = str(cl.user_id)
+    info = cl.account_info()
+    uname = str(info.username)
+    print(json.dumps({"success": True, "userId": uid, "username": uname, "sessionData": session}))
+except Exception as e:
+    print(json.dumps({"success": False, "error": str(e)}))
+\`;
+  return runPython(script);
+}
+
 async function instagrapiLogin(username, password) {
   const script = `
 import sys, json
@@ -294,24 +314,31 @@ try:
     from instagrapi import Client
     cl = Client()
     cl.delay_range = [2, 5]
-    cl.login("${username.replace(/"/g, '')}", "${password.replace(/"/g, '')}")
+    cl.login("${username.replace(/"/g, '')}","${password.replace(/"/g, '')}")
     session = json.dumps(cl.get_settings())
     uid = str(cl.user_id)
     print(json.dumps({"success": True, "userId": uid, "username": "${username}", "sessionData": session}))
 except Exception as e:
     print(json.dumps({"success": False, "error": str(e)}))
-`;
+\`;
   return runPython(script);
 }
 
 // ── INSTAGRAM VERIFY ──────────────────────────────────────────────────────────
 app.post("/api/instagram/verify", auth, async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: "Username and password required" });
-  const result = await instagrapiLogin(username, password);
-  if (result.success) res.json({ success: true, userId: result.userId, username: result.username });
-  else res.status(400).json({ success: false, error: result.error });
+  const { username, password, sessionId } = req.body;
+  if (sessionId) {
+    const result = await instagrapiLoginWithCookie(sessionId);
+    if (result.success) res.json({ success: true, userId: result.userId, username: result.username });
+    else res.status(400).json({ success: false, error: result.error });
+  } else {
+    if (!username || !password) return res.status(400).json({ error: "Username and password required" });
+    const result = await instagrapiLogin(username, password);
+    if (result.success) res.json({ success: true, userId: result.userId, username: result.username });
+    else res.status(400).json({ success: false, error: result.error });
+  }
 });
+
 
 // ── ACCOUNT ROUTES ────────────────────────────────────────────────────────────
 app.get("/api/accounts", auth, async (req, res) => {
@@ -329,17 +356,20 @@ app.post("/api/accounts", auth, async (req, res) => {
     if (accountCount >= limits.maxAccounts && !user.isAdmin)
       return res.status(403).json({ error: `Your ${user.plan} plan allows max ${limits.maxAccounts} account(s). Upgrade to add more.` });
 
-    const { username, igPassword, niche, postsPerDay, hashtags, captionStyle, customCaption, autoRequeue, postingTimes, firstComment } = req.body;
-    if (!username || !igPassword) return res.status(400).json({ error: "Instagram username and password required" });
+    const { username, igPassword, sessionId, niche, postsPerDay, hashtags, captionStyle, customCaption, autoRequeue, postingTimes, firstComment } = req.body;
+    if (!username) return res.status(400).json({ error: "Instagram username required" });
+    if (!sessionId && !igPassword) return res.status(400).json({ error: "Session cookie or password required" });
 
-    const loginResult = await instagrapiLogin(username, igPassword);
+    const loginResult = sessionId
+      ? await instagrapiLoginWithCookie(sessionId)
+      : await instagrapiLogin(username, igPassword);
     if (!loginResult.success) return res.status(400).json({ error: `Instagram login failed: ${loginResult.error}` });
 
     const acc = await Account.create({
       userId: req.user.id,
-      username: username.replace("@", "").toLowerCase().trim(),
+      username: (loginResult.username || username).replace("@", "").toLowerCase().trim(),
       igUserId: loginResult.userId || "",
-      igPassword,
+      igPassword: igPassword || "",
       sessionData: loginResult.sessionData || "",
       sessionSavedAt: new Date(),
       niche: niche || "General",
