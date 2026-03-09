@@ -325,6 +325,40 @@ app.post("/api/instagram/verify", auth, async (req, res) => {
 });
 
 // ── ACCOUNT ROUTES ────────────────────────────────────────────────────────────
+// ── VERIFY CODE (2FA / EMAIL CHALLENGE) ──────────────────────────────────────
+app.post("/api/accounts/verify-code", auth, async (req, res) => {
+  try {
+    const { username, password, verificationCode, tempSession, niche, postsPerDay, hashtags, captionStyle, customCaption, autoRequeue, postingTimes } = req.body;
+    if (!verificationCode) return res.status(400).json({ error: "Verification code required" });
+
+    const loginResult = await instagrapiLogin(username, password, verificationCode, tempSession);
+
+    if (loginResult.needsCode) return res.status(400).json({ error: "Code was incorrect, please try again" });
+    if (!loginResult.success) return res.status(400).json({ error: `Login failed: ${loginResult.error}` });
+
+    const acc = await Account.create({
+      userId: req.user.id,
+      username: (loginResult.username || username || "").replace("@", "").toLowerCase().trim(),
+      igUserId: loginResult.userId || "",
+      igPassword: password ? await bcrypt.hash(password, 10) : "",
+      sessionData: loginResult.sessionData || "",
+      sessionSavedAt: new Date(),
+      niche: niche || "General",
+      postsPerDay: postsPerDay || 5,
+      postingTimes: postingTimes || ["09:00", "12:00", "15:00", "18:00", "21:00"],
+      hashtags: hashtags || "",
+      captionStyle: captionStyle || "original",
+      customCaption: customCaption || "",
+      autoRequeue: autoRequeue || false,
+      status: "active",
+    });
+
+    await logActivity(req.user.id, acc._id, "account_connected", `@${acc.username} connected via password+code`);
+    await notifyUser(req.user.id, "connected", { username: acc.username, niche: acc.niche });
+    res.json({ success: true, account: acc });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get("/api/accounts", auth, async (req, res) => {
   try {
     const accounts = await Account.find({ userId: req.user.id }).sort({ createdAt: -1 });
@@ -334,17 +368,26 @@ app.get("/api/accounts", auth, async (req, res) => {
 
 app.post("/api/accounts", auth, async (req, res) => {
   try {
-    const { username, igPassword, sessionId, niche, postsPerDay, hashtags, captionStyle, customCaption, appendHashtags, autoRequeue, postingTimes } = req.body;
+    const { username, password, igPassword, sessionId, niche, postsPerDay, hashtags, captionStyle, customCaption, appendHashtags, autoRequeue, postingTimes } = req.body;
+    const igPass = password || igPassword;
 
-    // ✅ FIX: sessionId alone is sufficient — username is fetched from Instagram automatically
-    if (!sessionId && !igPassword) return res.status(400).json({ error: "Session cookie or password required" });
+    if (!sessionId && !igPass) return res.status(400).json({ error: "Session cookie or password required" });
     if (!sessionId && !username) return res.status(400).json({ error: "Instagram username required when using password login" });
 
     let loginResult;
     if (sessionId) {
       loginResult = await instagrapiLoginWithCookie(sessionId.trim());
     } else {
-      loginResult = await instagrapiLogin(username, igPassword);
+      loginResult = await instagrapiLogin(username, igPass);
+    }
+
+    // Instagram requires verification code
+    if (loginResult.needsCode) {
+      return res.status(200).json({
+        needsCode: true,
+        tempSession: loginResult.tempSession || "",
+        message: "Instagram sent a verification code to your email/phone. Please enter it.",
+      });
     }
 
     if (!loginResult.success) return res.status(400).json({ error: `Instagram login failed: ${loginResult.error}` });
@@ -754,29 +797,56 @@ except Exception as e:
 }
 
 // ── INSTAGRAPI — PASSWORD LOGIN ───────────────────────────────────────────────
-async function instagrapiLogin(username, password, existingSession = null) {
+async function instagrapiLogin(username, password, verificationCode = null, tempSession = null) {
   return new Promise((resolve) => {
     const script = `
-import sys
-import json
+import sys, json
 try:
     from instagrapi import Client
+    from instagrapi.exceptions import ChallengeRequired, TwoFactorRequired
+
     cl = Client()
     cl.delay_range = [2, 5]
-    ${existingSession ? `
+
+    ${tempSession ? `
+    # Resume session for verification code
     try:
-        cl.load_settings(json.loads('''${existingSession}'''))
-        cl.login('${username}', '${password}')
+        cl.set_settings(json.loads('''${tempSession}'''))
     except:
-        cl = Client()
-        cl.delay_range = [2, 5]
-        cl.login('${username}', '${password}')
-    ` : `cl.login('${username}', '${password}')`}
+        pass
+    ` : ''}
+
+    def challenge_code_handler(username, choice):
+        # Signal that we need a code
+        print(json.dumps({"needsCode": True, "tempSession": json.dumps(cl.get_settings())}), flush=True)
+        sys.exit(42)
+
+    cl.challenge_code_handler = challenge_code_handler
+
+    ${verificationCode ? `
+    # Submit verification code
+    try:
+        cl.challenge_resolve(cl.last_json, "${verificationCode}")
+    except Exception:
+        cl.login('${username}', '${password}', verification_code="${verificationCode}")
+    ` : `
+    cl.login('${username}', '${password}')
+    `}
+
     session = json.dumps(cl.get_settings())
     user_id = str(cl.user_id)
     print(json.dumps({"success": True, "userId": user_id, "username": "${username}", "sessionData": session}))
+
+except SystemExit as e:
+    if e.code != 42:
+        print(json.dumps({"success": False, "error": "System exit"}))
 except Exception as e:
-    print(json.dumps({"success": False, "error": str(e)}))
+    err = str(e)
+    # Check if it's a challenge error not caught by handler
+    if "challenge" in err.lower() or "verify" in err.lower() or "code" in err.lower():
+        print(json.dumps({"needsCode": True, "tempSession": json.dumps(cl.get_settings() if cl else {}), "error": err}))
+    else:
+        print(json.dumps({"success": False, "error": err}))
 `;
     const py = spawn("python3", ["-c", script]);
     let output = "", errOutput = "";
@@ -789,7 +859,7 @@ except Exception as e:
         for (const line of lines) {
           try {
             const parsed = JSON.parse(line.trim());
-            if (parsed && typeof parsed === "object" && "success" in parsed) { result = parsed; break; }
+            if (parsed && typeof parsed === "object" && ("success" in parsed || "needsCode" in parsed)) { result = parsed; break; }
           } catch {}
         }
         resolve(result || { success: false, error: errOutput || "Python/Instagrapi not available" });
