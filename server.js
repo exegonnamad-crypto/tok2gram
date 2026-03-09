@@ -675,7 +675,6 @@ import sys, json, uuid, random
 try:
     from instagrapi import Client
 
-    # Generate consistent device fingerprint based on session id
     seed = "${cleanId}"[:8]
     random.seed(seed)
 
@@ -687,7 +686,6 @@ try:
     cl = Client()
     cl.delay_range = [3, 7]
 
-    # Set device BEFORE logging in - use consistent fingerprint
     cl.set_settings({
         "uuids": {
             "phone_id": phone_id,
@@ -712,15 +710,22 @@ try:
         "cookies": {"sessionid": "${cleanId}"},
     })
 
-    # Use login_by_sessionid - do NOT call get_timeline_feed (triggers security)
     cl.login_by_sessionid("${cleanId}")
 
-    # Only fetch account info - minimal footprint
     uid = str(cl.user_id)
-    info = cl.account_info()
-    uname = str(info.username)
 
-    # Save full session with device fingerprint
+    # Safely get account info - handle missing fields in newer IG API
+    try:
+        info = cl.account_info()
+        uname = str(info.username)
+    except Exception:
+        # Fallback: get username from user info
+        try:
+            user_info = cl.user_info(uid)
+            uname = str(user_info.username)
+        except Exception:
+            uname = "unknown"
+
     session = json.dumps(cl.get_settings())
     print(json.dumps({"success": True, "userId": uid, "username": uname, "sessionData": session}))
 except Exception as e:
