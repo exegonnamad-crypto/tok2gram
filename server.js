@@ -669,7 +669,7 @@ app.get("/api/activity", auth, async (req, res) => {
 // ── INSTAGRAPI — COOKIE LOGIN ─────────────────────────────────────────────────
 async function instagrapiLoginWithCookie(sessionId) {
   return new Promise((resolve) => {
-    const cleanId = sessionId.replace(/["']/g, "").trim();
+    const cleanId = decodeURIComponent(sessionId.replace(/["']/g, "").trim());
     const script = `
 import sys, json, uuid, random
 try:
