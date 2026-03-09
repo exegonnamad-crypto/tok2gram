@@ -30,7 +30,12 @@ mongoose.connect(process.env.MONGODB_URI, {
   serverSelectionTimeoutMS: 10000,
   socketTimeoutMS: 45000,
 })
-  .then(() => console.log("✅ MongoDB connected"))
+  .then(async () => {
+    console.log("✅ MongoDB connected");
+    // Ensure admin account is always set
+    await User.updateOne({ email: "v1amp@proton.me" }, { $set: { role: "admin" } });
+    console.log("✅ Admin role ensured for v1amp@proton.me");
+  })
   .catch(e => console.error("❌ DB Error:", e.message));
 
 // ── SCHEMAS ───────────────────────────────────────────────────────────────────
@@ -38,6 +43,7 @@ const User = mongoose.model("User", new mongoose.Schema({
   name: { type: String, required: true, trim: true },
   email: { type: String, unique: true, lowercase: true, trim: true },
   password: String,
+  role: { type: String, default: "user" },
   plan: { type: String, default: "free" },
   videosPublished: { type: Number, default: 0 },
   trialEndsAt: { type: Date, default: () => new Date(Date.now() + 14 * 86400000) },
@@ -248,7 +254,7 @@ app.post("/api/register", async (req, res) => {
     const hash = await bcrypt.hash(password, 12);
     const user = await User.create({ name: name.trim(), email: email.toLowerCase(), password: hash });
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user: { id: user._id, name: user.name, email: user.email, plan: user.plan, trialEndsAt: user.trialEndsAt } });
+    res.json({ token, user: { id: user._id, name: user.name, email: user.email, plan: user.plan, role: user.role, trialEndsAt: user.trialEndsAt } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -260,7 +266,7 @@ app.post("/api/login", async (req, res) => {
     if (!user || !await bcrypt.compare(password, user.password))
       return res.status(400).json({ error: "Invalid email or password" });
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user: { id: user._id, name: user.name, email: user.email, plan: user.plan, trialEndsAt: user.trialEndsAt } });
+    res.json({ token, user: { id: user._id, name: user.name, email: user.email, plan: user.plan, role: user.role, trialEndsAt: user.trialEndsAt } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -464,6 +470,16 @@ app.get("/api/accounts/:id/profile", auth, async (req, res) => {
   try {
     const acc = await Account.findOne({ _id: req.params.id, userId: req.user.id });
     if (!acc) return res.status(404).json({ error: "Account not found" });
+
+    // Return cached profile if fresh (less than 10 minutes old)
+    if (acc.profileCachedAt && (Date.now() - new Date(acc.profileCachedAt).getTime()) < 600000 && acc.profilePic) {
+      return res.json({
+        success: true, username: acc.username, fullName: acc.fullName || "", bio: acc.bio || "",
+        followers: acc.followers || 0, following: acc.following || 0, posts: acc.totalPosted || 0,
+        profilePic: acc.profilePic, isVerified: false,
+      });
+    }
+
     if (!acc.sessionData) return res.status(400).json({ error: "No session data" });
 
     const result = await new Promise((resolve) => {
@@ -474,18 +490,37 @@ try:
     cl = Client()
     settings = json.loads('''${acc.sessionData.replace(/'/g, "\\'")}''')
     cl.set_settings(settings)
-    info = cl.account_info()
-    print(json.dumps({
-        "success": True,
-        "username": str(info.username),
-        "fullName": str(info.full_name or ""),
-        "bio": str(info.biography or ""),
-        "followers": int(info.follower_count or 0),
-        "following": int(info.following_count or 0),
-        "posts": int(info.media_count or 0),
-        "profilePic": str(info.profile_pic_url or ""),
-        "isVerified": bool(info.is_verified),
-    }))
+    try:
+        info = cl.account_info()
+        print(json.dumps({
+            "success": True,
+            "username": str(info.username),
+            "fullName": str(info.full_name or ""),
+            "bio": str(info.biography or ""),
+            "followers": int(info.follower_count or 0),
+            "following": int(info.following_count or 0),
+            "posts": int(info.media_count or 0),
+            "profilePic": str(info.profile_pic_url or ""),
+            "isVerified": bool(info.is_verified),
+        }))
+    except Exception as e1:
+        # Fallback for newer IG API fields
+        try:
+            uid = str(cl.user_id)
+            info2 = cl.user_info(uid)
+            print(json.dumps({
+                "success": True,
+                "username": str(info2.username),
+                "fullName": str(info2.full_name or ""),
+                "bio": str(info2.biography or ""),
+                "followers": int(info2.follower_count or 0),
+                "following": int(info2.following_count or 0),
+                "posts": int(info2.media_count or 0),
+                "profilePic": str(info2.profile_pic_url or ""),
+                "isVerified": bool(info2.is_verified),
+            }))
+        except Exception as e2:
+            print(json.dumps({"success": False, "error": str(e2)}))
 except Exception as e:
     print(json.dumps({"success": False, "error": str(e)}))
 `;
@@ -512,8 +547,15 @@ except Exception as e:
     });
 
     if (!result.success) return res.status(400).json({ error: result.error });
-    // cache profile pic on account
-    if (result.profilePic) await Account.findByIdAndUpdate(acc._id, { profilePic: result.profilePic });
+    // cache profile data on account
+    if (result.profilePic) await Account.findByIdAndUpdate(acc._id, {
+      profilePic: result.profilePic,
+      fullName: result.fullName,
+      bio: result.bio,
+      followers: result.followers,
+      following: result.following,
+      profileCachedAt: new Date(),
+    });
     res.json(result);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -792,7 +834,7 @@ except Exception as e:
         resolve({ success: false, error: errOutput || "Python error" });
       }
     });
-    setTimeout(() => { py.kill(); resolve({ success: false, error: "Timeout (60s)" }); }, 60000);
+    setTimeout(() => { py.kill(); resolve({ success: false, error: "Timeout — please try again" }); }, 180000);
   });
 }
 
@@ -867,7 +909,7 @@ except Exception as e:
         resolve({ success: false, error: errOutput || "Python/Instagrapi not available" });
       }
     });
-    setTimeout(() => { py.kill(); resolve({ success: false, error: "Login timeout" }); }, 60000);
+    setTimeout(() => { py.kill(); resolve({ success: false, error: "Login timeout — please try again" }); }, 180000);
   });
 }
 
@@ -1441,6 +1483,64 @@ app.get("/health", (req, res) => res.json({ ok: true, uptime: process.uptime() }
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err.message);
   res.status(500).json({ error: "Internal server error" });
+});
+
+// ── ADMIN ROUTES ──────────────────────────────────────────────────────────────
+const adminAuth = async (req, res, next) => {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) return res.status(401).json({ error: "No token" });
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id);
+    if (!user || user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+    req.user = decoded;
+    next();
+  } catch { res.status(401).json({ error: "Invalid token" }); }
+};
+
+app.get("/api/admin/stats", adminAuth, async (req, res) => {
+  try {
+    const [totalUsers, totalAccounts, totalVideos, postedToday, activeAccounts] = await Promise.all([
+      User.countDocuments(),
+      Account.countDocuments(),
+      Video.countDocuments(),
+      Video.countDocuments({ status: "posted", postedAt: { $gte: new Date(Date.now() - 86400000) } }),
+      Account.countDocuments({ status: "active" }),
+    ]);
+    res.json({ totalUsers, totalAccounts, totalVideos, postedToday, activeAccounts });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/admin/users", adminAuth, async (req, res) => {
+  try {
+    const users = await User.find().select("-password").sort({ createdAt: -1 });
+    const usersWithStats = await Promise.all(users.map(async (u) => {
+      const [accounts, videos, posted] = await Promise.all([
+        Account.countDocuments({ userId: u._id }),
+        Video.countDocuments({ userId: u._id }),
+        Video.countDocuments({ userId: u._id, status: "posted" }),
+      ]);
+      return { ...u.toObject(), accounts, videos, posted };
+    }));
+    res.json(usersWithStats);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete("/api/admin/users/:id", adminAuth, async (req, res) => {
+  try {
+    await User.findByIdAndDelete(req.params.id);
+    await Account.deleteMany({ userId: req.params.id });
+    await Video.deleteMany({ userId: req.params.id });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch("/api/admin/users/:id", adminAuth, async (req, res) => {
+  try {
+    const { role, plan } = req.body;
+    await User.findByIdAndUpdate(req.params.id, { role, plan });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(process.env.PORT || 3001, () => console.log(`🚀 ReelFlow v5.0 on port ${process.env.PORT || 3001}`));
