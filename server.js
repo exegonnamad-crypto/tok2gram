@@ -671,16 +671,57 @@ async function instagrapiLoginWithCookie(sessionId) {
   return new Promise((resolve) => {
     const cleanId = sessionId.replace(/["']/g, "").trim();
     const script = `
-import sys, json
+import sys, json, uuid, random
 try:
     from instagrapi import Client
+
+    # Generate consistent device fingerprint based on session id
+    seed = "${cleanId}"[:8]
+    random.seed(seed)
+
+    phone_id = str(uuid.UUID(int=random.getrandbits(128)))
+    device_id = "android-" + hex(random.getrandbits(64))[2:]
+    uuid_val = str(uuid.UUID(int=random.getrandbits(128)))
+    adv_id = str(uuid.UUID(int=random.getrandbits(128)))
+
     cl = Client()
-    cl.delay_range = [2, 5]
+    cl.delay_range = [3, 7]
+
+    # Set device BEFORE logging in - use consistent fingerprint
+    cl.set_settings({
+        "uuids": {
+            "phone_id": phone_id,
+            "uuid": uuid_val,
+            "client_session_id": str(uuid.UUID(int=random.getrandbits(128))),
+            "advertising_id": adv_id,
+            "device_id": device_id,
+        },
+        "device_settings": {
+            "app_version": "269.0.0.18.75",
+            "android_version": 26,
+            "android_release": "8.0.0",
+            "dpi": "480dpi",
+            "resolution": "1080x1920",
+            "manufacturer": "OnePlus",
+            "device": "devitron",
+            "model": "6T Dev",
+            "cpu": "qcom",
+            "version_code": "301484483",
+        },
+        "user_agent": "Instagram 269.0.0.18.75 Android (26/8.0.0; 480dpi; 1080x1920; OnePlus; 6T Dev; devitron; qcom; en_US; 301484483)",
+        "cookies": {"sessionid": "${cleanId}"},
+    })
+
+    # Use login_by_sessionid - do NOT call get_timeline_feed (triggers security)
     cl.login_by_sessionid("${cleanId}")
-    session = json.dumps(cl.get_settings())
+
+    # Only fetch account info - minimal footprint
     uid = str(cl.user_id)
     info = cl.account_info()
     uname = str(info.username)
+
+    # Save full session with device fingerprint
+    session = json.dumps(cl.get_settings())
     print(json.dumps({"success": True, "userId": uid, "username": uname, "sessionData": session}))
 except Exception as e:
     print(json.dumps({"success": False, "error": str(e)}))
@@ -934,23 +975,68 @@ async function postViaInstagrapi(sessionData, videoPath, caption) {
     const escapedCaption = caption.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n");
     const escapedPath = videoPath.replace(/\\/g, "/");
     const script = `
-import sys, json
+import sys, json, time, random
 try:
     from instagrapi import Client
+    from instagrapi.exceptions import LoginRequired, PleaseWaitFewMinutes
+
     cl = Client()
-    cl.delay_range = [1, 3]
+    # Use longer human-like delays to avoid detection
+    cl.delay_range = [3, 6]
+
+    # Restore exact saved session including device fingerprint
     settings = json.loads('''${sessionData.replace(/'/g, "\\'")}''')
     cl.set_settings(settings)
-    cl.get_timeline_feed()
+
+    # Re-inject session cookie from saved settings
+    cookies = settings.get("cookies", {})
+    session_id = cookies.get("sessionid", "")
+    if session_id:
+        cl.login_by_sessionid(session_id)
+
+    # Small human-like delay before posting
+    time.sleep(random.uniform(2, 4))
+
+    # Upload reel directly - no timeline feed call (that triggers security checks)
     media = cl.clip_upload('${escapedPath}', caption='${escapedCaption}')
+
+    # Save updated session
     try:
         new_session = json.dumps(cl.get_settings())
     except:
         new_session = ""
+
     print(json.dumps({"success": True, "mediaId": str(media.pk), "sessionData": new_session}))
+
+except LoginRequired as e:
+    print(json.dumps({"success": False, "error": "LoginRequired: session expired — please reconnect with a fresh cookie"}))
+except PleaseWaitFewMinutes as e:
+    print(json.dumps({"success": False, "error": "Instagram rate limited — will retry in a few minutes"}))
 except Exception as e:
     print(json.dumps({"success": False, "error": str(e)}))
 `;
+    const py = spawn("python3", ["-c", script]);
+    let output = "", errOutput = "";
+    py.stdout.on("data", d => output += d.toString());
+    py.stderr.on("data", d => errOutput += d.toString());
+    py.on("close", () => {
+      try {
+        const lines = output.trim().split("\n").reverse();
+        let result = null;
+        for (const line of lines) {
+          try {
+            const parsed = JSON.parse(line.trim());
+            if (parsed && typeof parsed === "object" && "success" in parsed) { result = parsed; break; }
+          } catch {}
+        }
+        resolve(result || { success: false, error: errOutput || output || "No valid response" });
+      } catch {
+        resolve({ success: false, error: errOutput || "Instagrapi error" });
+      }
+    });
+    setTimeout(() => { py.kill(); resolve({ success: false, error: "Post timeout (120s)" }); }, 120000);
+  });
+}
     const py = spawn("python3", ["-c", script]);
     let output = "", errOutput = "";
     py.stdout.on("data", d => output += d.toString());
