@@ -1037,28 +1037,6 @@ except Exception as e:
     setTimeout(() => { py.kill(); resolve({ success: false, error: "Post timeout (120s)" }); }, 120000);
   });
 }
-    const py = spawn("python3", ["-c", script]);
-    let output = "", errOutput = "";
-    py.stdout.on("data", d => output += d.toString());
-    py.stderr.on("data", d => errOutput += d.toString());
-    py.on("close", () => {
-      try {
-        const lines = output.trim().split("\n").reverse();
-        let result = null;
-        for (const line of lines) {
-          try {
-            const parsed = JSON.parse(line.trim());
-            if (parsed && typeof parsed === "object" && "success" in parsed) { result = parsed; break; }
-          } catch {}
-        }
-        resolve(result || { success: false, error: errOutput || output || "No valid response" });
-      } catch {
-        resolve({ success: false, error: errOutput || "Instagrapi error" });
-      }
-    });
-    setTimeout(() => { py.kill(); resolve({ success: false, error: "Post timeout (120s)" }); }, 120000);
-  });
-}
 
 // ── ANALYTICS ─────────────────────────────────────────────────────────────────
 app.get("/api/analytics", auth, async (req, res) => {
