@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Install instagrapi
-RUN pip3 install instagrapi Pillow --break-system-packages
+# Install instagrapi 2.3.0 + dependencies
+RUN pip3 install instagrapi==2.3.0 Pillow requests --break-system-packages
 
 WORKDIR /app
 
