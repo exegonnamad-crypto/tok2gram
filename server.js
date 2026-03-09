@@ -331,7 +331,57 @@ app.post("/api/instagram/verify", auth, async (req, res) => {
 });
 
 // ── ACCOUNT ROUTES ────────────────────────────────────────────────────────────
-// ── VERIFY CODE (2FA / EMAIL CHALLENGE) ──────────────────────────────────────
+// ── AUTHORIZE POLLING ─────────────────────────────────────────────────────────
+app.get("/api/accounts/authorize-status/:sessionKey", auth, async (req, res) => {
+  const { sessionKey } = req.params;
+  const pending = pendingAuthorizations.get(sessionKey);
+  if (!pending) return res.status(404).json({ error: "Session expired — please try again" });
+  if (pending.userId !== req.user.id) return res.status(403).json({ error: "Unauthorized" });
+
+  // Try login again with saved temp session
+  const result = await instagrapiLoginWithTempSession(pending.username, pending.password, pending.tempSession);
+
+  if (result.success) {
+    pendingAuthorizations.delete(sessionKey);
+    // Create the account
+    try {
+      const { niche, postsPerDay, hashtags, captionStyle, customCaption, autoRequeue, postingTimes } = pending.accountData;
+      const acc = await Account.create({
+        userId: req.user.id,
+        username: (result.username || pending.username || "").replace("@", "").toLowerCase().trim(),
+        igUserId: result.userId || "",
+        igPassword: pending.password ? await bcrypt.hash(pending.password, 10) : "",
+        sessionData: result.sessionData || "",
+        sessionSavedAt: new Date(),
+        niche: niche || "General",
+        postsPerDay: postsPerDay || 5,
+        postingTimes: postingTimes || ["09:00","12:00","15:00","18:00","21:00"],
+        hashtags: hashtags || "",
+        captionStyle: captionStyle || "original",
+        customCaption: customCaption || "",
+        autoRequeue: autoRequeue || false,
+        status: "active",
+      });
+      await logActivity(req.user.id, acc._id, "account_connected", `@${acc.username} connected via authorization`);
+      await notifyUser(req.user.id, "connected", { username: acc.username, niche: acc.niche });
+      return res.json({ authorized: true, account: acc });
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
+  }
+
+  if (result.pending) {
+    // Update temp session if we got a new one
+    if (result.tempSession) pending.tempSession = result.tempSession;
+    return res.json({ pending: true, message: "Still waiting... tap 'This was me' on your phone" });
+  }
+
+  // Hard failure
+  pendingAuthorizations.delete(sessionKey);
+  return res.status(400).json({ error: result.error || "Authorization failed" });
+});
+
+// ── VERIFY CODE (legacy) ──────────────────────────────────────────────────────
 app.post("/api/accounts/verify-code", auth, async (req, res) => {
   try {
     const { username, password, verificationCode, tempSession, niche, postsPerDay, hashtags, captionStyle, customCaption, autoRequeue, postingTimes } = req.body;
@@ -378,7 +428,7 @@ app.post("/api/accounts", auth, async (req, res) => {
     const igPass = password || igPassword;
 
     if (!sessionId && !igPass) return res.status(400).json({ error: "Session cookie or password required" });
-    if (!sessionId && !username) return res.status(400).json({ error: "Instagram username required when using password login" });
+    if (!sessionId && !username) return res.status(400).json({ error: "Instagram username required" });
 
     let loginResult;
     if (sessionId) {
@@ -387,13 +437,20 @@ app.post("/api/accounts", auth, async (req, res) => {
       loginResult = await instagrapiLogin(username, igPass);
     }
 
-    // Instagram requires verification code
-    if (loginResult.needsCode) {
-      return res.status(200).json({
-        needsCode: true,
-        tempSession: loginResult.tempSession || "",
-        message: "Instagram sent a verification code to your email/phone. Please enter it.",
+    // Instagram requires phone authorization
+    if (loginResult.pending) {
+      const sessionKey = `${req.user.id}:${username}:${Date.now()}`;
+      pendingAuthorizations.set(sessionKey, {
+        status: "pending",
+        username, password: igPass,
+        tempSession: loginResult.tempSession || "{}",
+        accountData: { niche, postsPerDay, hashtags, captionStyle, customCaption, autoRequeue, postingTimes },
+        userId: req.user.id,
+        createdAt: Date.now(),
       });
+      // Clean up after 5 minutes
+      setTimeout(() => pendingAuthorizations.delete(sessionKey), 300000);
+      return res.json({ pending: true, sessionKey, message: "Check your phone and tap 'This was me' to authorize" });
     }
 
     if (!loginResult.success) return res.status(400).json({ error: `Instagram login failed: ${loginResult.error}` });
@@ -839,56 +896,52 @@ except Exception as e:
 }
 
 // ── INSTAGRAPI — PASSWORD LOGIN ───────────────────────────────────────────────
-async function instagrapiLogin(username, password, verificationCode = null, tempSession = null) {
+// In-memory store for pending authorizations
+const pendingAuthorizations = new Map(); // sessionKey -> { status, sessionData, username, userId, error }
+
+async function instagrapiLogin(username, password) {
   return new Promise((resolve) => {
     const script = `
-import sys, json
+import sys, json, time
 try:
     from instagrapi import Client
-    from instagrapi.exceptions import ChallengeRequired, TwoFactorRequired
+    from instagrapi.exceptions import ChallengeRequired, LoginRequired
 
     cl = Client()
-    cl.delay_range = [2, 5]
+    cl.delay_range = [2, 4]
 
-    ${tempSession ? `
-    # Resume session for verification code
+    def challenge_handler(username, choice):
+        # Return 0 = approve via notification (no code needed)
+        return 0
+
+    cl.challenge_code_handler = challenge_handler
+
     try:
-        cl.set_settings(json.loads('''${tempSession}'''))
-    except:
-        pass
-    ` : ''}
+        cl.login('${username}', '${password}')
+        session = json.dumps(cl.get_settings())
+        user_id = str(cl.user_id)
+        print(json.dumps({"success": True, "userId": user_id, "username": "${username}", "sessionData": session}))
+    except ChallengeRequired:
+        # Instagram sent a push notification to their phone
+        # Return pending state with temp session so we can poll
+        try:
+            temp = json.dumps(cl.get_settings())
+        except:
+            temp = "{}"
+        print(json.dumps({"pending": True, "tempSession": temp}))
+    except Exception as inner:
+        err = str(inner)
+        if "challenge" in err.lower() or "verify" in err.lower() or "wait" in err.lower():
+            try:
+                temp = json.dumps(cl.get_settings())
+            except:
+                temp = "{}"
+            print(json.dumps({"pending": True, "tempSession": temp}))
+        else:
+            print(json.dumps({"success": False, "error": err}))
 
-    def challenge_code_handler(username, choice):
-        # Signal that we need a code
-        print(json.dumps({"needsCode": True, "tempSession": json.dumps(cl.get_settings())}), flush=True)
-        sys.exit(42)
-
-    cl.challenge_code_handler = challenge_code_handler
-
-    ${verificationCode ? `
-    # Submit verification code
-    try:
-        cl.challenge_resolve(cl.last_json, "${verificationCode}")
-    except Exception:
-        cl.login('${username}', '${password}', verification_code="${verificationCode}")
-    ` : `
-    cl.login('${username}', '${password}')
-    `}
-
-    session = json.dumps(cl.get_settings())
-    user_id = str(cl.user_id)
-    print(json.dumps({"success": True, "userId": user_id, "username": "${username}", "sessionData": session}))
-
-except SystemExit as e:
-    if e.code != 42:
-        print(json.dumps({"success": False, "error": "System exit"}))
 except Exception as e:
-    err = str(e)
-    # Check if it's a challenge error not caught by handler
-    if "challenge" in err.lower() or "verify" in err.lower() or "code" in err.lower():
-        print(json.dumps({"needsCode": True, "tempSession": json.dumps(cl.get_settings() if cl else {}), "error": err}))
-    else:
-        print(json.dumps({"success": False, "error": err}))
+    print(json.dumps({"success": False, "error": str(e)}))
 `;
     const py = spawn("python3", ["-c", script]);
     let output = "", errOutput = "";
@@ -897,19 +950,84 @@ except Exception as e:
     py.on("close", () => {
       try {
         const lines = output.trim().split("\n").reverse();
-        let result = null;
         for (const line of lines) {
           try {
             const parsed = JSON.parse(line.trim());
-            if (parsed && typeof parsed === "object" && ("success" in parsed || "needsCode" in parsed)) { result = parsed; break; }
+            if (parsed && typeof parsed === "object" && ("success" in parsed || "pending" in parsed)) {
+              resolve(parsed); return;
+            }
           } catch {}
         }
-        resolve(result || { success: false, error: errOutput || "Python/Instagrapi not available" });
+        resolve({ success: false, error: errOutput || "Python/Instagrapi not available" });
       } catch {
         resolve({ success: false, error: errOutput || "Python/Instagrapi not available" });
       }
     });
     setTimeout(() => { py.kill(); resolve({ success: false, error: "Login timeout — please try again" }); }, 180000);
+  });
+}
+
+async function instagrapiLoginWithTempSession(username, password, tempSession) {
+  return new Promise((resolve) => {
+    const safeTempSession = (tempSession || "{}").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const script = `
+import sys, json, time
+try:
+    from instagrapi import Client
+    from instagrapi.exceptions import ChallengeRequired, LoginRequired
+
+    cl = Client()
+    cl.delay_range = [2, 4]
+
+    try:
+        cl.set_settings(json.loads('${safeTempSession}'))
+    except:
+        pass
+
+    def challenge_handler(username, choice):
+        return 0
+
+    cl.challenge_code_handler = challenge_handler
+
+    # Try to resume — if user approved on phone this should work
+    try:
+        cl.login('${username}', '${password}')
+        session = json.dumps(cl.get_settings())
+        user_id = str(cl.user_id)
+        print(json.dumps({"success": True, "userId": user_id, "username": "${username}", "sessionData": session}))
+    except ChallengeRequired:
+        print(json.dumps({"pending": True}))
+    except Exception as e2:
+        err = str(e2)
+        if "challenge" in err.lower() or "verify" in err.lower():
+            print(json.dumps({"pending": True}))
+        else:
+            print(json.dumps({"success": False, "error": err}))
+
+except Exception as e:
+    print(json.dumps({"success": False, "error": str(e)}))
+`;
+    const py = spawn("python3", ["-c", script]);
+    let output = "", errOutput = "";
+    py.stdout.on("data", d => output += d.toString());
+    py.stderr.on("data", d => errOutput += d.toString());
+    py.on("close", () => {
+      try {
+        const lines = output.trim().split("\n").reverse();
+        for (const line of lines) {
+          try {
+            const parsed = JSON.parse(line.trim());
+            if (parsed && typeof parsed === "object" && ("success" in parsed || "pending" in parsed)) {
+              resolve(parsed); return;
+            }
+          } catch {}
+        }
+        resolve({ success: false, error: errOutput || "No response" });
+      } catch {
+        resolve({ success: false, error: "Python error" });
+      }
+    });
+    setTimeout(() => { py.kill(); resolve({ pending: true }); }, 60000);
   });
 }
 
