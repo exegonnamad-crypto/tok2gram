@@ -1000,34 +1000,28 @@ def make_client(proxy='', saved_settings=None):
 
 function runPython(script, timeoutMs = 60000, env = {}) {
   return new Promise((resolve) => {
-    // Indent user script 4 spaces so it runs inside top-level try/except
-    const indented = script.split("\n").map(l => "    " + l).join("\n");
-    const wrapped = `import sys, json as _j, traceback as _tb
-try:
-${indented}
-except Exception as _e:
-    print(_j.dumps({"success": False, "error": str(_e), "trace": _tb.format_exc()[-800:]}))
-`;
-    const py = spawn("python3", ["-c", wrapped], { env: { ...process.env, ...env } });
+    const fs = require("fs");
+    const tmpFile = `/app/downloads/ig_${Date.now()}.py`;
+    try { fs.writeFileSync(tmpFile, script); } catch(e) { resolve({ success: false, error: "Cannot write temp file: " + e.message }); return; }
+    const py = spawn("python3", [tmpFile], { env: { ...process.env, ...env } });
     let out = "", err = "";
     py.stdout.on("data", d => out += d.toString());
     py.stderr.on("data", d => err += d.toString());
     py.on("close", (code) => {
-      if (err) console.error(`Python stderr (exit ${code}):`, err.slice(0, 800));
+      try { fs.unlinkSync(tmpFile); } catch {}
+      if (code !== 0 || err) console.error(`[Python exit=${code}] stderr: ${err.slice(0, 1000)}`);
       const lines = out.trim().split("\n").reverse();
       for (const line of lines) {
         try {
           const parsed = JSON.parse(line.trim());
-          if (parsed && typeof parsed === "object") {
-            if (parsed.trace) console.error("Python traceback:", parsed.trace);
-            resolve(parsed); return;
-          }
+          if (parsed && typeof parsed === "object") { resolve(parsed); return; }
         } catch {}
       }
-      console.error("No JSON output. stdout:", out.slice(0, 300));
-      resolve({ success: false, error: err.split("\n").filter(l => l.trim()).pop() || out.trim() || "Python error - check Railway logs" });
+      console.error(`[Python] no JSON. stdout: ${out.slice(0,300)}`);
+      const errLine = err.split("\n").filter(l => l.trim() && !l.startsWith(" ")).pop() || err.trim() || "Python failed silently";
+      resolve({ success: false, error: errLine });
     });
-    setTimeout(() => { py.kill(); resolve({ success: false, error: "Python timed out after " + timeoutMs/1000 + "s" }); }, timeoutMs);
+    setTimeout(() => { py.kill(); resolve({ success: false, error: "Timeout" }); }, timeoutMs);
   });
 }
 
@@ -1042,8 +1036,16 @@ async function igLogin(username, password, proxyUrl = "", accountId = "") {
   const setup = pySetup(proxyUrl, accountId || cleanUser);
   // Pass password via env var — avoids ALL escaping issues with special chars
   const script = `
-${setup}
-import os
+import sys, json, time, random, os, traceback
+try:
+    from instagrapi import Client
+    from instagrapi.exceptions import LoginRequired, ChallengeRequired, FeedbackRequired, PleaseWaitFewMinutes, BadPassword, UserNotFound
+except Exception as import_err:
+    print(json.dumps({"success": False, "error": "instagrapi import failed: " + str(import_err)}))
+    sys.exit(0)
+
+${setup.replace(/^import sys.*\n.*\n/m, '').trim()}
+
 _password = os.environ.get("IG_PASSWORD", "")
 try:
     cl = make_client(proxy_url)
@@ -1060,23 +1062,15 @@ try:
         print(json.dumps({"success": False, "error": "Account not found — check the username"}))
         sys.exit(0)
     except FeedbackRequired as fe:
-        msg = str(fe).lower()
         session = cl.get_settings()
         print(json.dumps({"pending": True, "tempSession": json.dumps(session)}))
         sys.exit(0)
     session = cl.get_settings()
     print(json.dumps({"success": True, "userId": str(cl.user_id), "username": str(cl.username), "sessionData": json.dumps(session)}))
 except PleaseWaitFewMinutes:
-    print(json.dumps({"success": False, "error": "Instagram rate limited — wait 10 minutes and try again"}))
+    print(json.dumps({"success": False, "error": "Rate limited — wait 10 minutes"}))
 except Exception as e:
-    msg = str(e)
-    if "we can" in msg.lower() or "find an account" in msg.lower() or "username" in msg.lower():
-        print(json.dumps({"success": False, "error": "Login blocked by Instagram — try a different proxy or wait 10 minutes"}))
-    elif "checkpoint" in msg.lower() or "challenge" in msg.lower():
-        print(json.dumps({"pending": True, "tempSession": "{}"}))
-    else:
-        import traceback
-        print(json.dumps({"success": False, "error": msg, "trace": traceback.format_exc()[-500:]}))
+    print(json.dumps({"success": False, "error": str(e), "trace": traceback.format_exc()[-800:]}))
 `;
   return runPython(script, 90000, { IG_PASSWORD: password });
 }
@@ -1747,6 +1741,18 @@ cron.schedule("0 */2 * * *", async () => {
 // ── HEALTH ────────────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "✅ ReelFlow API v5.0 — Phone Authorization", version: "5.0.0", uptime: process.uptime() }));
 app.get("/health", (req, res) => res.json({ ok: true, uptime: process.uptime() }));
+
+app.get("/api/test-python", async (req, res) => {
+  const { exec } = require("child_process");
+  exec('python3 -c "import instagrapi; print(\'ok\')"', { timeout: 20000 }, (err, stdout, stderr) => {
+    res.json({
+      pythonWorks: !err,
+      stdout: stdout?.trim(),
+      stderr: stderr?.trim(),
+      error: err?.message,
+    });
+  });
+});
 
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err.message);
