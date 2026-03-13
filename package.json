@@ -1,17 +1,21 @@
 {
-  "name": "tok2gram-backend",
-  "version": "5.0.0",
+  "name": "reelflow-backend",
+  "version": "6.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "axios": "^1.6.0",
     "bcryptjs": "^2.4.3",
-    "cloudinary": "^1.41.3",
+    "bluebird": "^3.7.2",
+    "cloudinary": "^1.41.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
+    "https-proxy-agent": "^7.0.2",
+    "instagram-private-api": "^1.45.3",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.0.3",
     "node-cron": "^3.0.3"
