@@ -1000,13 +1000,20 @@ def make_client(proxy='', saved_settings=None):
 
 function runPython(script, timeoutMs = 60000, env = {}) {
   return new Promise((resolve) => {
-    const py = spawn("python3", ["-c", script], {
-      env: { ...process.env, ...env }
-    });
+    // Indent user script 4 spaces so it runs inside top-level try/except
+    const indented = script.split("\n").map(l => "    " + l).join("\n");
+    const wrapped = `import sys, json as _j, traceback as _tb
+try:
+${indented}
+except Exception as _e:
+    print(_j.dumps({"success": False, "error": str(_e), "trace": _tb.format_exc()[-800:]}))
+`;
+    const py = spawn("python3", ["-c", wrapped], { env: { ...process.env, ...env } });
     let out = "", err = "";
     py.stdout.on("data", d => out += d.toString());
     py.stderr.on("data", d => err += d.toString());
-    py.on("close", () => {
+    py.on("close", (code) => {
+      if (err) console.error(`Python stderr (exit ${code}):`, err.slice(0, 800));
       const lines = out.trim().split("\n").reverse();
       for (const line of lines) {
         try {
@@ -1017,11 +1024,10 @@ function runPython(script, timeoutMs = 60000, env = {}) {
           }
         } catch {}
       }
-      console.error("Python stderr:", err.slice(0, 1000));
-      console.error("Python stdout:", out.slice(0, 500));
-      resolve({ success: false, error: err.split("\n").filter(l => l.trim()).pop() || "Python error" });
+      console.error("No JSON output. stdout:", out.slice(0, 300));
+      resolve({ success: false, error: err.split("\n").filter(l => l.trim()).pop() || out.trim() || "Python error - check Railway logs" });
     });
-    setTimeout(() => { py.kill(); resolve({ success: false, error: "Timeout" }); }, timeoutMs);
+    setTimeout(() => { py.kill(); resolve({ success: false, error: "Python timed out after " + timeoutMs/1000 + "s" }); }, timeoutMs);
   });
 }
 
