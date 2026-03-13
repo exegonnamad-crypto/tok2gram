@@ -464,75 +464,96 @@ const pendingAuthorizations = new Map();
 
 async function instagrapiLogin(username, password, proxyUrl = "", accountId = "") {
   const cleanUser = username.replace("@", "").toLowerCase().trim();
-  console.log(`🔐 Login @${cleanUser} via proxy: ${proxyUrl || "DIRECT (no proxy)"}`);
+  console.log(`🔐 LOGIN START @${cleanUser} proxy=${proxyUrl || "NONE"}`);
   return new Promise((resolve) => {
     const setup = pySetup(proxyUrl, accountId);
     const safePass = password.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-
-    // Write to temp file — avoids -c indentation/length issues
     const tmpFile = `/tmp/ig_login_${Date.now()}.py`;
-    const script = `${setup}
-ig_username = '${cleanUser}'
-ig_password = '${safePass}'
 
-try:
-    from instagrapi.exceptions import ChallengeRequired, LoginRequired, FeedbackRequired, BadPassword, UserNotFound
+    const pyLines = [
+      setup,
+      "import sys, traceback",
+      "print('DEBUG: python started', file=sys.stderr)",
+      "try:",
+      "    from instagrapi import Client",
+      "    from instagrapi.exceptions import ChallengeRequired, LoginRequired, FeedbackRequired, BadPassword, UserNotFound, PleaseWaitFewMinutes, ClientForbiddenError",
+      "    print('DEBUG: imports ok', file=sys.stderr)",
+      "except Exception as ie:",
+      "    print(json.dumps({'success': False, 'error': 'import failed: ' + str(ie)}))",
+      "    sys.exit(1)",
+      "",
+      `ig_username = '${cleanUser}'`,
+      `ig_password = '${safePass}'`,
+      "print('DEBUG: proxy=' + str(proxy_url), file=sys.stderr)",
+      "print('DEBUG: user=' + ig_username, file=sys.stderr)",
+      "try:",
+      "    cl = make_client(proxy_url)",
+      "    print('DEBUG: client ok', file=sys.stderr)",
+      "    try:",
+      "        cl.login(ig_username, ig_password)",
+      "        print('DEBUG: login ok', file=sys.stderr)",
+      "        session = json.dumps(cl.get_settings())",
+      "        print(json.dumps({'success': True, 'userId': str(cl.user_id), 'username': ig_username, 'sessionData': session}))",
+      "    except BadPassword:",
+      "        print('DEBUG: bad password', file=sys.stderr)",
+      "        print(json.dumps({'success': False, 'error': 'Wrong password - please check and try again'}))",
+      "    except UserNotFound as e:",
+      "        print('DEBUG: user not found: ' + str(e), file=sys.stderr)",
+      "        print(json.dumps({'success': False, 'error': 'Account not found. If the account exists, Railway IP is blocked - try enabling a proxy.'}))",
+      "    except ChallengeRequired:",
+      "        print('DEBUG: challenge required', file=sys.stderr)",
+      "        try: temp = json.dumps(cl.get_settings())",
+      "        except: temp = '{}'",
+      "        print(json.dumps({'pending': True, 'tempSession': temp}))",
+      "    except FeedbackRequired as e:",
+      "        print('DEBUG: feedback required: ' + str(e), file=sys.stderr)",
+      "        try:",
+      "            cl.private_request('consent/existing_user_flow/', data={'current_screen_key': 'qp_intro', 'updates': json.dumps({'existing_user_flow_intro_key': 'seen'})})",
+      "            time.sleep(random.uniform(4, 7))",
+      "            cl.login(ig_username, ig_password)",
+      "            session = json.dumps(cl.get_settings())",
+      "            print(json.dumps({'success': True, 'userId': str(cl.user_id), 'username': ig_username, 'sessionData': session}))",
+      "        except ChallengeRequired:",
+      "            try: temp = json.dumps(cl.get_settings())",
+      "            except: temp = '{}'",
+      "            print(json.dumps({'pending': True, 'tempSession': temp}))",
+      "        except Exception as e2:",
+      "            print(json.dumps({'success': False, 'error': 'Instagram flagged login: ' + str(e2)}))",
+      "    except PleaseWaitFewMinutes:",
+      "        print(json.dumps({'success': False, 'error': 'Instagram rate limited - wait a few minutes and try again'}))",
+      "    except Exception as e:",
+      "        err = str(e); elow = err.lower()",
+      "        print('DEBUG: exception: ' + err, file=sys.stderr)",
+      "        traceback.print_exc(file=sys.stderr)",
+      "        if 'challenge' in elow or 'verify' in elow:",
+      "            try: temp = json.dumps(cl.get_settings())",
+      "            except: temp = '{}'",
+      "            print(json.dumps({'pending': True, 'tempSession': temp}))",
+      "        elif 'bad_password' in elow or 'wrong password' in elow:",
+      "            print(json.dumps({'success': False, 'error': 'Wrong password - please check and try again'}))",
+      "        elif 'user_not_found' in elow or 'find an account' in elow:",
+      "            print(json.dumps({'success': False, 'error': 'Account not found or IP blocked by Instagram. Enable a proxy and retry.'}))",
+      "        elif 'feedback_required' in elow or 'automated' in elow:",
+      "            print(json.dumps({'success': False, 'error': 'Instagram flagged this as automated. Try a different proxy.'}))",
+      "        elif 'please wait' in elow or 'few minutes' in elow:",
+      "            print(json.dumps({'success': False, 'error': 'Instagram rate limited - wait a few minutes and try again'}))",
+      "        else:",
+      "            print(json.dumps({'success': False, 'error': err}))",
+      "except Exception as outer:",
+      "    print('DEBUG: outer: ' + str(outer), file=sys.stderr)",
+      "    traceback.print_exc(file=sys.stderr)",
+      "    print(json.dumps({'success': False, 'error': str(outer)}))",
+    ];
 
-    cl = make_client(proxy_url)
-
-    def do_login(attempt=1):
-        try:
-            cl.login(ig_username, ig_password, relogin=True)
-            return {"success": True}
-        except Exception as e:
-            err = str(e).lower()
-            raw = str(e)
-            # Bad password
-            if "bad_password" in err or "password" in err and "wrong" in err:
-                return {"success": False, "error": "Wrong password — please check and try again"}
-            # User not found — catch by class OR message
-            if "user_not_found" in err or "we can" in err or "find an account" in err or "not found" in err:
-                return {"success": False, "error": "Instagram account not found — check the username"}
-            # Rate limited
-            if "please wait" in err or "few minutes" in err or "wait a few" in err:
-                return {"success": False, "error": "Instagram rate limited — please wait a few minutes and try again"}
-            # Challenge / phone verify
-            if "challenge" in err or "verify" in err:
-                return {"pending": True}
-            # Feedback required — dismiss and retry
-            if "feedback_required" in err or "automated" in err:
-                try:
-                    cl.private_request("consent/existing_user_flow/", data={"current_screen_key": "qp_intro", "updates": json.dumps({"existing_user_flow_intro_key": "seen"})})
-                    time.sleep(random.uniform(4, 7))
-                except: pass
-                if attempt < 3:
-                    time.sleep(random.uniform(5, 10))
-                    return do_login(attempt + 1)
-                return {"success": False, "error": "Instagram flagged this login — try a different proxy or wait a few minutes"}
-            return {"success": False, "error": raw}
-
-    result = do_login()
-
-    if result.get("success"):
-        session = json.dumps(cl.get_settings())
-        print(json.dumps({"success": True, "userId": str(cl.user_id), "username": ig_username, "sessionData": session}))
-    elif result.get("pending"):
-        try: temp = json.dumps(cl.get_settings())
-        except: temp = "{}"
-        print(json.dumps({"pending": True, "tempSession": temp}))
-    else:
-        print(json.dumps({"success": False, "error": result.get("error", "Unknown error")}))
-
-except Exception as e:
-    print(json.dumps({"success": False, "error": str(e)}))
-`;
-    require("fs").writeFileSync(tmpFile, script);
+    require("fs").writeFileSync(tmpFile, pyLines.join("\n"));
     const py = spawn("python3", [tmpFile]);
     let output = "", errOutput = "";
-    py.stdout.on("data", d => output += d.toString());
-    py.stderr.on("data", d => errOutput += d.toString());
-    py.on("close", () => {
+    py.stdout.on("data", d => { output += d.toString(); });
+    py.stderr.on("data", d => { errOutput += d.toString(); process.stdout.write(`[PY] ${d.toString()}`); });
+    py.on("close", (code) => {
       require("fs").unlink(tmpFile, () => {});
+      console.log(`🔐 LOGIN END @${cleanUser} exit=${code}`);
+      console.log(`[PY STDOUT] ${output.trim().slice(0, 300)}`);
       try {
         const lines = output.trim().split("\n").reverse();
         for (const line of lines) {
@@ -541,13 +562,19 @@ except Exception as e:
             if (parsed && typeof parsed === "object" && ("success" in parsed || "pending" in parsed)) { resolve(parsed); return; }
           } catch {}
         }
-        console.error("instagrapiLogin stderr:", errOutput.slice(0, 500));
-        resolve({ success: false, error: errOutput || "Python/Instagrapi not available" });
-      } catch { resolve({ success: false, error: "Python error" }); }
+        console.error("❌ No valid JSON from Python. stderr:", errOutput.slice(0, 500));
+        resolve({ success: false, error: errOutput.slice(0, 300) || "No response from Python" });
+      } catch (e) { resolve({ success: false, error: "Parse error: " + e.message }); }
     });
-    setTimeout(() => { py.kill(); require("fs").unlink(tmpFile, () => {}); resolve({ success: false, error: "Login timeout — Instagram not reachable. Try a different proxy." }); }, 60000);
+    setTimeout(() => {
+      py.kill();
+      require("fs").unlink(tmpFile, () => {});
+      console.error(`⏱ LOGIN TIMEOUT @${cleanUser}`);
+      resolve({ success: false, error: "Login timed out. Instagram unreachable — proxy may be down." });
+    }, 60000);
   });
 }
+
 
 async function instagrapiLoginWithTempSession(username, password, tempSession, proxyUrl = "", accountId = "") {
   const cleanUser = username.replace("@", "").toLowerCase().trim();
@@ -681,7 +708,8 @@ app.post("/api/accounts", auth, async (req, res) => {
     if (!igPass) return res.status(400).json({ error: "Password required" });
     if (!username) return res.status(400).json({ error: "Instagram username required" });
 
-    const proxy = proxyMode === "none" ? "" : (proxyUrl || proxyPool.next());
+    // Always force proxy — Railway datacenter IP is flagged by Instagram
+    const proxy = (proxyMode === "fixed" && proxyUrl) ? proxyUrl : (proxyUrl || proxyPool.next());
     const loginResult = await instagrapiLogin(username, igPass, proxy, reconnectId || "");
 
     if (loginResult.pending) {
