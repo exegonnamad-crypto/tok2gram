@@ -471,7 +471,18 @@ app.post("/api/accounts", auth, async (req, res) => {
     if (!igPass) return res.status(400).json({ error: "Password required" });
     if (!username) return res.status(400).json({ error: "Instagram username required" });
 
-    const loginResult = await igLogin(username, igPass, proxyUrl || "", reconnectId || "");
+    // Pick proxy based on mode — always use a proxy for login
+    let loginProxy = "";
+    if (proxyMode === "none") {
+      loginProxy = "";
+    } else if (proxyMode === "fixed" && proxyUrl) {
+      loginProxy = proxyUrl;
+    } else {
+      // rotate (default) — always pull from pool for login
+      loginProxy = proxyPool.next();
+    }
+    console.log(`🔐 Login @${username} via proxy: ${loginProxy ? loginProxy.split("@")[1] : "DIRECT (no proxy)"}`);
+    const loginResult = await igLogin(username, igPass, loginProxy, reconnectId || "");
 
     // Instagram requires phone authorization
     if (loginResult.pending) {
@@ -987,9 +998,11 @@ def make_client(proxy='', saved_settings=None):
 `;
 }
 
-function runPython(script, timeoutMs = 60000) {
+function runPython(script, timeoutMs = 60000, env = {}) {
   return new Promise((resolve) => {
-    const py = spawn("python3", ["-c", script]);
+    const py = spawn("python3", ["-c", script], {
+      env: { ...process.env, ...env }
+    });
     let out = "", err = "";
     py.stdout.on("data", d => out += d.toString());
     py.stderr.on("data", d => err += d.toString());
@@ -998,11 +1011,15 @@ function runPython(script, timeoutMs = 60000) {
       for (const line of lines) {
         try {
           const parsed = JSON.parse(line.trim());
-          if (parsed && typeof parsed === "object") { resolve(parsed); return; }
+          if (parsed && typeof parsed === "object") {
+            if (parsed.trace) console.error("Python traceback:", parsed.trace);
+            resolve(parsed); return;
+          }
         } catch {}
       }
-      console.error("Python stderr:", err.slice(0, 500));
-      resolve({ success: false, error: err.split("\n").filter(l => l.includes("Error") || l.includes("error")).pop() || "Python error" });
+      console.error("Python stderr:", err.slice(0, 1000));
+      console.error("Python stdout:", out.slice(0, 500));
+      resolve({ success: false, error: err.split("\n").filter(l => l.trim()).pop() || "Python error" });
     });
     setTimeout(() => { py.kill(); resolve({ success: false, error: "Timeout" }); }, timeoutMs);
   });
@@ -1017,14 +1034,15 @@ async function igLogin(username, password, proxyUrl = "", accountId = "") {
     try { await Account.findByIdAndUpdate(accountId, { sessionData: null, sessionSavedAt: null }); } catch {}
   }
   const setup = pySetup(proxyUrl, accountId || cleanUser);
-  // Escape password safely for Python string
-  const safePass = password.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  // Pass password via env var — avoids ALL escaping issues with special chars
   const script = `
 ${setup}
+import os
+_password = os.environ.get("IG_PASSWORD", "")
 try:
     cl = make_client(proxy_url)
     try:
-        cl.login("${cleanUser}", """${safePass}""")
+        cl.login("${cleanUser}", _password)
     except ChallengeRequired:
         session = cl.get_settings()
         print(json.dumps({"pending": True, "tempSession": json.dumps(session)}))
@@ -1038,36 +1056,40 @@ try:
     except FeedbackRequired as fe:
         msg = str(fe).lower()
         session = cl.get_settings()
-        if 'challenge' in msg or 'verify' in msg or 'checkpoint' in msg:
-            print(json.dumps({"pending": True, "tempSession": json.dumps(session)}))
-        else:
-            print(json.dumps({"pending": True, "tempSession": json.dumps(session)}))
+        print(json.dumps({"pending": True, "tempSession": json.dumps(session)}))
         sys.exit(0)
     session = cl.get_settings()
     print(json.dumps({"success": True, "userId": str(cl.user_id), "username": str(cl.username), "sessionData": json.dumps(session)}))
 except PleaseWaitFewMinutes:
     print(json.dumps({"success": False, "error": "Instagram rate limited — wait 10 minutes and try again"}))
 except Exception as e:
-    print(json.dumps({"success": False, "error": str(e)}))
+    msg = str(e)
+    if "we can" in msg.lower() or "find an account" in msg.lower() or "username" in msg.lower():
+        print(json.dumps({"success": False, "error": "Login blocked by Instagram — try a different proxy or wait 10 minutes"}))
+    elif "checkpoint" in msg.lower() or "challenge" in msg.lower():
+        print(json.dumps({"pending": True, "tempSession": "{}"}))
+    else:
+        import traceback
+        print(json.dumps({"success": False, "error": msg, "trace": traceback.format_exc()[-500:]}))
 `;
-  return runPython(script, 90000);
+  return runPython(script, 90000, { IG_PASSWORD: password });
 }
 
 async function igLoginWithSession(username, password, tempSessionStr, proxyUrl = "", accountId = "") {
   const cleanUser = username.replace("@", "").toLowerCase().trim();
-  const safePass = password.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   const setup = pySetup(proxyUrl, accountId || cleanUser);
-  const safeSess = (tempSessionStr && tempSessionStr !== "{}") ? tempSessionStr.replace(/\\/g, "\\\\").replace(/'/g, "\\'") : "";
+  const safeSess = "";
 
   const script = `
 ${setup}
-import json as _json
+import os
+_password = os.environ.get("IG_PASSWORD", "")
 _raw_sess = '${safeSess}'
-_saved = _json.loads(_raw_sess) if _raw_sess else None
+_saved = json.loads(_raw_sess) if _raw_sess else None
 try:
     cl = make_client(proxy_url, saved_settings=_saved)
     try:
-        cl.login("${cleanUser}", """${safePass}""")
+        cl.login("${cleanUser}", _password)
     except ChallengeRequired:
         session = cl.get_settings()
         print(json.dumps({"pending": True, "tempSession": json.dumps(session)}))
@@ -1080,7 +1102,7 @@ try:
 except Exception as e:
     print(json.dumps({"pending": True, "tempSession": "{}"}))
 `;
-  return runPython(script, 90000);
+  return runPython(script, 90000, { IG_PASSWORD: password });
 }
 
 // ── POST VIDEO ────────────────────────────────────────────────────────────────
