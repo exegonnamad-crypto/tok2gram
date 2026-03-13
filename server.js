@@ -465,7 +465,7 @@ app.get("/api/accounts", auth, async (req, res) => {
 
 app.post("/api/accounts", auth, async (req, res) => {
   try {
-    const { username, password, igPassword, niche, postsPerDay, hashtags, captionStyle, customCaption, appendHashtags, autoRequeue, postingTimes, proxyUrl } = req.body;
+    const { username, password, igPassword, niche, postsPerDay, hashtags, captionStyle, customCaption, appendHashtags, autoRequeue, postingTimes, proxyUrl, proxyMode, reconnectId } = req.body;
     const igPass = password || igPassword;
 
     if (!igPass) return res.status(400).json({ error: "Password required" });
