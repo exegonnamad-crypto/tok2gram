@@ -1048,49 +1048,36 @@ async function igLogin(username, password, proxyUrl = "", accountId = "") {
       }
     }
     if (e instanceof IgLoginBadPasswordError) {
-      return { success: false, error: "Wrong password — please check and try again" };
+      return { success: false, error: "Wrong password — please double-check and try again" };
     }
     if (e instanceof IgLoginInvalidUserError) {
-      return { success: false, error: "Instagram account not found — check the username" };
+      // This can fire for blocked IPs too, not just missing accounts
+      return { success: false, error: "Login blocked — Instagram rejected this request. Try switching proxy or wait 10 minutes." };
     }
     if (e instanceof IgActionSpamError) {
-      return { success: false, error: "Instagram rate limit — wait 10 minutes and try again" };
+      return { success: false, error: "Instagram rate limited — wait 10 minutes and try again" };
     }
-    const msg = e.message?.toLowerCase() || "";
+    const msg = (e.message || "").toLowerCase();
+    const json = (() => { try { return JSON.stringify(e.response?.body || {}); } catch { return ""; } })();
+
+    console.error(`igLogin error for @${username}: ${e.constructor?.name} — ${e.message}`, json);
+
     if (msg.includes("challenge") || msg.includes("checkpoint") || msg.includes("verify")) {
       return { pending: true, tempSession: "{}" };
     }
-    if (msg.includes("feedback") || msg.includes("automated") || msg.includes("suspicious")) {
-      // Try preLoginFlow reset and retry once
-      try {
-        const { ig: ig2 } = createIgClient(accountId || username);
-        ig2.state.generateDevice(username);
-        applyProxy(ig2, proxyUrl);
-        await humanDelay(8000, 15000);
-        await ig2.simulate.preLoginFlow();
-        const loggedInUser2 = await ig2.account.login(username, password);
-        await ig2.simulate.postLoginFlow();
-        const session2 = await ig2.state.serialize();
-        delete session2.constants;
-        return {
-          success: true,
-          userId: loggedInUser2.pk.toString(),
-          username: loggedInUser2.username,
-          sessionData: JSON.stringify(session2),
-        };
-      } catch (e2) {
-        if (e2 instanceof IgCheckpointError) {
-          try {
-            const session = await ig.state.serialize();
-            delete session.constants;
-            return { pending: true, tempSession: JSON.stringify(session) };
-          } catch { return { pending: true, tempSession: "{}" }; }
-        }
-        return { success: false, error: "Instagram is blocking this login. Try: open Instagram on your phone first, then reconnect." };
-      }
+    if (msg.includes("feedback") || msg.includes("automated") || msg.includes("suspicious") || msg.includes("spam")) {
+      return { success: false, error: "Instagram flagged this login as suspicious. Open Instagram on your phone, then try again in 5 minutes." };
     }
-    console.error(`igLogin full error for @${username}:`, e);
-    return { success: false, error: e.message || "Login failed" };
+    if (msg.includes("bad_password") || msg.includes("invalid_credentials")) {
+      return { success: false, error: "Wrong password — please double-check and try again" };
+    }
+    if (msg.includes("invalid_user") || msg.includes("user_not_found") || msg.includes("no_user")) {
+      return { success: false, error: "Login blocked by Instagram — this usually means the IP/proxy is blocked. Try a different proxy." };
+    }
+    if (msg.includes("network") || msg.includes("econnrefused") || msg.includes("timeout") || msg.includes("econnreset")) {
+      return { success: false, error: "Proxy connection failed — check your proxy is working and try again." };
+    }
+    return { success: false, error: `Instagram login failed: ${e.message || "Unknown error"}. Check Railway logs for details.` };
   }
 }
 
