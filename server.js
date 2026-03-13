@@ -580,28 +580,19 @@ app.get("/api/accounts/:id/profile", auth, async (req, res) => {
 
     if (!acc.sessionData) return res.status(400).json({ error: "No session data" });
 
-    // Fetch profile using instagram-private-api
-    let result = { success: false, error: "Could not fetch profile" };
-    try {
-      const { ig } = createIgClient(acc._id.toString());
-      ig.state.generateDevice(acc.username);
-      applyProxy(ig, getProxy(acc));
-      await ig.state.deserialize(JSON.parse(acc.sessionData));
-      const info = await ig.account.currentUser();
-      result = {
-        success: true,
-        username: info.username,
-        fullName: info.full_name || "",
-        bio: info.biography || "",
-        followers: info.follower_count || 0,
-        following: info.following_count || 0,
-        posts: info.media_count || 0,
-        profilePic: info.profile_pic_url || "",
-        isVerified: info.is_verified || false,
-      };
-    } catch (e) {
-      result = { success: false, error: e.message };
-    }
+    // Fetch profile using instagrapi
+    const profileSetup = pySetup(getProxy(acc), acc._id.toString());
+    const profileSafeSess = acc.sessionData.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const profileScript = profileSetup + `
+try:
+    settings = json.loads('` + profileSafeSess + `')
+    cl = make_client(proxy_url, saved_settings=settings)
+    info = cl.user_info(str(cl.user_id))
+    print(json.dumps({"success": True, "username": str(info.username), "fullName": str(info.full_name or ""), "bio": str(info.biography or ""), "followers": int(info.follower_count or 0), "following": int(info.following_count or 0), "posts": int(info.media_count or 0), "profilePic": str(info.profile_pic_url or ""), "isVerified": bool(info.is_verified)}))
+except Exception as e:
+    print(json.dumps({"success": False, "error": str(e)}))
+`;
+    const result = await runPython(profileScript, 30000);
 
     if (!result.success) return res.status(400).json({ error: result.error });
     // cache profile data on account
@@ -935,256 +926,225 @@ app.get("/api/proxy/test-all", auth, async (req, res) => {
   res.json(results);
 });
 
-// ── INSTAGRAM PRIVATE API (replaces Python/instagrapi) ───────────────────────
-let IgApiClient, IgCheckpointError, IgLoginBadPasswordError, IgLoginInvalidUserError,
-    IgNotFoundError, IgActionSpamError, IgResponseError;
-try {
-  const igPkg = require("instagram-private-api");
-  IgApiClient = igPkg.IgApiClient;
-  IgCheckpointError = igPkg.IgCheckpointError;
-  IgLoginBadPasswordError = igPkg.IgLoginBadPasswordError;
-  IgLoginInvalidUserError = igPkg.IgLoginInvalidUserError;
-  IgNotFoundError = igPkg.IgNotFoundError;
-  IgActionSpamError = igPkg.IgActionSpamError;
-  IgResponseError = igPkg.IgResponseError;
-  console.log("✅ instagram-private-api loaded");
-} catch (e) {
-  console.error("❌ instagram-private-api NOT installed:", e.message);
-  console.error("Run: npm install instagram-private-api");
-}
+// ── PYTHON / INSTAGRAPI ──────────────────────────────────────────────────────
 const { promisify } = require("util");
 const readFileAsync = promisify(require("fs").readFile);
 
-// ── DEVICE FINGERPRINT GENERATOR ─────────────────────────────────────────────
+// ── DEVICE FINGERPRINT ────────────────────────────────────────────────────────
 const ANDROID_DEVICES = [
-  { manufacturer: "Samsung",  model: "SM-G991B",  device: "o1s",      android_version: "12", android_release: "12" },
-  { manufacturer: "Samsung",  model: "SM-A536B",  device: "a53x",     android_version: "12", android_release: "12" },
-  { manufacturer: "OnePlus",  model: "CPH2399",   device: "op535",    android_version: "12", android_release: "12" },
-  { manufacturer: "Xiaomi",   model: "2201123G",  device: "cupid",    android_version: "12", android_release: "12" },
-  { manufacturer: "Xiaomi",   model: "220733SG",  device: "munch",    android_version: "12", android_release: "12" },
-  { manufacturer: "Realme",   model: "RMX3563",   device: "RM6785",   android_version: "11", android_release: "11" },
-  { manufacturer: "Oppo",     model: "CPH2387",   device: "OP52C1L1", android_version: "12", android_release: "12" },
-  { manufacturer: "Vivo",     model: "V2109",     device: "vivo1920", android_version: "11", android_release: "11" },
-  { manufacturer: "Motorola", model: "XT2201-3",  device: "tesla",    android_version: "12", android_release: "12" },
-  { manufacturer: "Nokia",    model: "TA-1428",   device: "NokiaX30", android_version: "12", android_release: "12" },
+  { manufacturer: "Samsung",  model: "SM-G991B",  android_version: 31, android_release: "12" },
+  { manufacturer: "Samsung",  model: "SM-A536B",  android_version: 31, android_release: "12" },
+  { manufacturer: "OnePlus",  model: "CPH2399",   android_version: 31, android_release: "12" },
+  { manufacturer: "Xiaomi",   model: "2201123G",  android_version: 31, android_release: "12" },
+  { manufacturer: "Xiaomi",   model: "220733SG",  android_version: 31, android_release: "12" },
+  { manufacturer: "Realme",   model: "RMX3563",   android_version: 30, android_release: "11" },
+  { manufacturer: "Oppo",     model: "CPH2387",   android_version: 31, android_release: "12" },
+  { manufacturer: "Motorola", model: "XT2201-3",  android_version: 31, android_release: "12" },
+  { manufacturer: "Nokia",    model: "TA-1428",   android_version: 31, android_release: "12" },
+  { manufacturer: "Vivo",     model: "V2109",     android_version: 30, android_release: "11" },
 ];
+const IG_APP_VERSIONS = ["269.0.0.18.75","265.0.0.19.301","261.0.0.21.111","257.0.0.20.101","253.0.0.22.119"];
 
 function seedRandom(str) {
   let h = 0;
-  for (let i = 0; i < str.length; i++) { h = Math.imul(31, h) + str.charCodeAt(i) | 0; }
+  for (let i = 0; i < str.length; i++) h = Math.imul(31, h) + str.charCodeAt(i) | 0;
   return Math.abs(h);
 }
 
-function getDeviceForAccount(accountId) {
-  const seed = seedRandom(accountId.toString());
-  return ANDROID_DEVICES[seed % ANDROID_DEVICES.length];
+function pySetup(proxyUrl = "", accountId = "") {
+  const seed = seedRandom(accountId || "default");
+  const dev = ANDROID_DEVICES[seed % ANDROID_DEVICES.length];
+  const appVer = IG_APP_VERSIONS[seed % IG_APP_VERSIONS.length];
+  const proxyLine = proxyUrl ? `proxy_url = '${proxyUrl}'` : `proxy_url = ''`;
+  return `
+import sys, json, time, random
+from instagrapi import Client
+from instagrapi.exceptions import LoginRequired, ChallengeRequired, FeedbackRequired, PleaseWaitFewMinutes, BadPassword, UserNotFound
+
+${proxyLine}
+
+def make_client(proxy='', saved_settings=None):
+    cl = Client()
+    cl.delay_range = [2, 5]
+    if proxy:
+        cl.set_proxy(proxy)
+    cl.set_device({
+        "app_version": "${appVer}",
+        "android_version": ${dev.android_version},
+        "android_release": "${dev.android_release}",
+        "dpi": "420dpi",
+        "resolution": "1080x2340",
+        "manufacturer": "${dev.manufacturer}",
+        "device": "${dev.model}",
+        "model": "${dev.model}",
+        "cpu": "qcom",
+        "version_code": "314665256"
+    })
+    cl.set_user_agent()
+    if saved_settings:
+        cl.set_settings(saved_settings)
+    return cl
+`;
 }
 
-// Create a fresh IgApiClient with device fingerprint seeded from accountId
-function createIgClient(accountId = "default") {
-  const ig = new IgApiClient();
-  const device = getDeviceForAccount(accountId);
-  // instagram-private-api generates device from username seed — we override after
-  return { ig, device };
+function runPython(script, timeoutMs = 60000) {
+  return new Promise((resolve) => {
+    const py = spawn("python3", ["-c", script]);
+    let out = "", err = "";
+    py.stdout.on("data", d => out += d.toString());
+    py.stderr.on("data", d => err += d.toString());
+    py.on("close", () => {
+      const lines = out.trim().split("\n").reverse();
+      for (const line of lines) {
+        try {
+          const parsed = JSON.parse(line.trim());
+          if (parsed && typeof parsed === "object") { resolve(parsed); return; }
+        } catch {}
+      }
+      console.error("Python stderr:", err.slice(0, 500));
+      resolve({ success: false, error: err.split("\n").filter(l => l.includes("Error") || l.includes("error")).pop() || "Python error" });
+    });
+    setTimeout(() => { py.kill(); resolve({ success: false, error: "Timeout" }); }, timeoutMs);
+  });
 }
-
-// Apply proxy to ig client
-function applyProxy(ig, proxyUrl) {
-  if (!proxyUrl) return;
-  try {
-    ig.state.proxyUrl = proxyUrl;
-  } catch {}
-}
-
-// Simulate human-like delay
-const humanDelay = (min = 2000, max = 6000) =>
-  new Promise(r => setTimeout(r, min + Math.random() * (max - min)));
 
 // ── LOGIN ─────────────────────────────────────────────────────────────────────
 const pendingAuthorizations = new Map();
 
 async function igLogin(username, password, proxyUrl = "", accountId = "") {
-  if (!IgApiClient) {
-    return { success: false, error: "instagram-private-api not installed on server. Run: npm install" };
-  }
-  const { ig } = createIgClient(accountId || username);
-  ig.state.generateDevice(username); // deterministic device per username
-  applyProxy(ig, proxyUrl);
-
-  // Wipe any existing session from DB before logging in fresh
-  // This prevents "multiple sessions" error — Instagram sees it as same device re-logging in
+  const cleanUser = username.replace("@", "").toLowerCase().trim();
   if (accountId) {
     try { await Account.findByIdAndUpdate(accountId, { sessionData: null, sessionSavedAt: null }); } catch {}
   }
-
-  try {
-    await humanDelay(2000, 4000); // wait before login attempt
-    await ig.simulate.preLoginFlow();
-    const loggedInUser = await ig.account.login(username, password);
-    await humanDelay(1000, 3000);
-    await ig.simulate.postLoginFlow();
-    const session = await ig.state.serialize();
-    delete session.constants; // don't store constants
-    return {
-      success: true,
-      userId: loggedInUser.pk.toString(),
-      username: loggedInUser.username,
-      sessionData: JSON.stringify(session),
-    };
-  } catch (e) {
-    if (e instanceof IgCheckpointError) {
-      // Instagram wants phone/email challenge — this is normal, handle it
-      try {
-        await ig.challenge.auto(true); // request SMS/push challenge
-        const session = await ig.state.serialize();
-        delete session.constants;
-        return {
-          pending: true,
-          tempSession: JSON.stringify(session),
-          challengeUrl: ig.state.checkpoint?.challenge?.api_path,
-        };
-      } catch (ce) {
-        return { pending: true, tempSession: "{}" };
-      }
-    }
-    if (e instanceof IgLoginBadPasswordError) {
-      return { success: false, error: "Wrong password — please double-check and try again" };
-    }
-    if (e instanceof IgLoginInvalidUserError) {
-      // This can fire for blocked IPs too, not just missing accounts
-      return { success: false, error: "Login blocked — Instagram rejected this request. Try switching proxy or wait 10 minutes." };
-    }
-    if (e instanceof IgActionSpamError) {
-      return { success: false, error: "Instagram rate limited — wait 10 minutes and try again" };
-    }
-    const msg = (e.message || "").toLowerCase();
-    const json = (() => { try { return JSON.stringify(e.response?.body || {}); } catch { return ""; } })();
-
-    console.error(`igLogin error for @${username}: ${e.constructor?.name} — ${e.message}`, json);
-
-    if (msg.includes("challenge") || msg.includes("checkpoint") || msg.includes("verify")) {
-      return { pending: true, tempSession: "{}" };
-    }
-    if (msg.includes("feedback") || msg.includes("automated") || msg.includes("suspicious") || msg.includes("spam")) {
-      return { success: false, error: "Instagram flagged this login as suspicious. Open Instagram on your phone, then try again in 5 minutes." };
-    }
-    if (msg.includes("bad_password") || msg.includes("invalid_credentials")) {
-      return { success: false, error: "Wrong password — please double-check and try again" };
-    }
-    if (msg.includes("invalid_user") || msg.includes("user_not_found") || msg.includes("no_user")) {
-      return { success: false, error: "Login blocked by Instagram — this usually means the IP/proxy is blocked. Try a different proxy." };
-    }
-    if (msg.includes("network") || msg.includes("econnrefused") || msg.includes("timeout") || msg.includes("econnreset")) {
-      return { success: false, error: "Proxy connection failed — check your proxy is working and try again." };
-    }
-    return { success: false, error: `Instagram login failed: ${e.message || "Unknown error"}. Check Railway logs for details.` };
-  }
+  const setup = pySetup(proxyUrl, accountId || cleanUser);
+  // Escape password safely for Python string
+  const safePass = password.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const script = `
+${setup}
+try:
+    cl = make_client(proxy_url)
+    try:
+        cl.login("${cleanUser}", """${safePass}""")
+    except ChallengeRequired:
+        session = cl.get_settings()
+        print(json.dumps({"pending": True, "tempSession": json.dumps(session)}))
+        sys.exit(0)
+    except BadPassword:
+        print(json.dumps({"success": False, "error": "Wrong password — please check and try again"}))
+        sys.exit(0)
+    except UserNotFound:
+        print(json.dumps({"success": False, "error": "Account not found — check the username"}))
+        sys.exit(0)
+    except FeedbackRequired as fe:
+        msg = str(fe).lower()
+        session = cl.get_settings()
+        if 'challenge' in msg or 'verify' in msg or 'checkpoint' in msg:
+            print(json.dumps({"pending": True, "tempSession": json.dumps(session)}))
+        else:
+            print(json.dumps({"pending": True, "tempSession": json.dumps(session)}))
+        sys.exit(0)
+    session = cl.get_settings()
+    print(json.dumps({"success": True, "userId": str(cl.user_id), "username": str(cl.username), "sessionData": json.dumps(session)}))
+except PleaseWaitFewMinutes:
+    print(json.dumps({"success": False, "error": "Instagram rate limited — wait 10 minutes and try again"}))
+except Exception as e:
+    print(json.dumps({"success": False, "error": str(e)}))
+`;
+  return runPython(script, 90000);
 }
 
-// Poll after user taps "This was me" on phone
 async function igLoginWithSession(username, password, tempSessionStr, proxyUrl = "", accountId = "") {
-  const { ig } = createIgClient(accountId || username);
-  ig.state.generateDevice(username);
-  applyProxy(ig, proxyUrl);
+  const cleanUser = username.replace("@", "").toLowerCase().trim();
+  const safePass = password.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const setup = pySetup(proxyUrl, accountId || cleanUser);
+  const safeSess = (tempSessionStr && tempSessionStr !== "{}") ? tempSessionStr.replace(/\\/g, "\\\\").replace(/'/g, "\\'") : "";
 
-  // Restore saved state if available
-  if (tempSessionStr && tempSessionStr !== "{}") {
-    try {
-      await ig.state.deserialize(JSON.parse(tempSessionStr));
-    } catch {}
-  }
-
-  try {
-    await ig.simulate.preLoginFlow();
-    const loggedInUser = await ig.account.login(username, password);
-    await humanDelay(1000, 2000);
-    await ig.simulate.postLoginFlow();
-    const session = await ig.state.serialize();
-    delete session.constants;
-    return {
-      success: true,
-      userId: loggedInUser.pk.toString(),
-      username: loggedInUser.username,
-      sessionData: JSON.stringify(session),
-    };
-  } catch (e) {
-    if (e instanceof IgCheckpointError) {
-      try {
-        // Check if checkpoint was already resolved (user tapped approve)
-        await ig.challenge.auto(true);
-        const session = await ig.state.serialize();
-        delete session.constants;
-        // Still pending — user hasn't tapped yet
-        return { pending: true, tempSession: JSON.stringify(session) };
-      } catch {
-        return { pending: true, tempSession: tempSessionStr };
-      }
-    }
-    if (e instanceof IgLoginBadPasswordError) {
-      return { success: false, error: "Wrong password" };
-    }
-    const msg = e.message?.toLowerCase() || "";
-    if (msg.includes("challenge") || msg.includes("checkpoint") || msg.includes("verify")) {
-      return { pending: true, tempSession: tempSessionStr };
-    }
-    return { success: false, error: e.message || "Login failed" };
-  }
+  const script = `
+${setup}
+import json as _json
+_raw_sess = '${safeSess}'
+_saved = _json.loads(_raw_sess) if _raw_sess else None
+try:
+    cl = make_client(proxy_url, saved_settings=_saved)
+    try:
+        cl.login("${cleanUser}", """${safePass}""")
+    except ChallengeRequired:
+        session = cl.get_settings()
+        print(json.dumps({"pending": True, "tempSession": json.dumps(session)}))
+        sys.exit(0)
+    except BadPassword:
+        print(json.dumps({"success": False, "error": "Wrong password"}))
+        sys.exit(0)
+    session = cl.get_settings()
+    print(json.dumps({"success": True, "userId": str(cl.user_id), "username": str(cl.username), "sessionData": json.dumps(session)}))
+except Exception as e:
+    print(json.dumps({"pending": True, "tempSession": "{}"}))
+`;
+  return runPython(script, 90000);
 }
 
-// ── POST TO INSTAGRAM ─────────────────────────────────────────────────────────
+// ── POST VIDEO ────────────────────────────────────────────────────────────────
 async function igPost(sessionData, videoPath, caption, proxyUrl = "", accountId = "") {
   if (!sessionData) return { success: false, error: "No session — please reconnect account" };
+  const setup = pySetup(proxyUrl, accountId);
+  const safeSess = sessionData.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const safeCap = caption.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+  const safePath = videoPath.replace(/\\/g, "/");
 
-  const { ig } = createIgClient(accountId);
-  ig.state.generateDevice(accountId || "default");
-  applyProxy(ig, proxyUrl);
-
-  try {
-    await ig.state.deserialize(JSON.parse(sessionData));
-  } catch (e) {
-    return { success: false, error: "Invalid session — please reconnect account" };
-  }
-
-  try {
-    await humanDelay(2000, 5000);
-
-    const videoBuffer = await readFileAsync(videoPath);
-
-    // Upload as reel (clip)
-    const publishResult = await ig.publish.video({
-      video: videoBuffer,
-      coverImage: videoBuffer, // instagram-private-api extracts frame automatically
-      caption: caption,
-    });
-
-    // Save updated session
-    let newSession = "";
-    try {
-      const updated = await ig.state.serialize();
-      delete updated.constants;
-      newSession = JSON.stringify(updated);
-    } catch {}
-
-    return {
-      success: true,
-      mediaId: publishResult.media?.pk?.toString() || publishResult.media?.id || "",
-      sessionData: newSession,
-    };
-  } catch (e) {
-    const msg = e.message?.toLowerCase() || "";
-
-    if (msg.includes("login_required") || msg.includes("not authorized") || msg.includes("checkpoint")) {
-      return { success: false, error: "Session expired — please reconnect account" };
-    }
-    if (msg.includes("feedback") || msg.includes("spam") || msg.includes("action_blocked")) {
-      return { success: false, error: "Instagram blocked this action — wait 30 minutes and retry" };
-    }
-    if (msg.includes("transcode") || msg.includes("video") || msg.includes("upload")) {
-      return { success: false, error: `Video upload failed: ${e.message}` };
-    }
-    return { success: false, error: e.message || "Post failed" };
-  }
+  const script = `
+${setup}
+try:
+    settings = json.loads('${safeSess}')
+    cl = make_client(proxy_url, saved_settings=settings)
+    try:
+        cl.get_timeline_feed()
+    except LoginRequired:
+        print(json.dumps({"success": False, "error": "Session expired — please reconnect account"}))
+        sys.exit(0)
+    except Exception:
+        pass
+    time.sleep(random.uniform(2, 5))
+    try:
+        media = cl.clip_upload('${safePath}', caption="""${safeCap}""")
+    except FeedbackRequired:
+        try:
+            cl.private_request("consent/existing_user_flow/", data={"current_screen_key": "qp_intro", "updates": json.dumps({"existing_user_flow_intro_key": "seen"})})
+            time.sleep(random.uniform(3, 6))
+            media = cl.clip_upload('${safePath}', caption="""${safeCap}""")
+        except Exception as fe2:
+            raise Exception(f"Feedback required: {str(fe2)}")
+    new_session = json.dumps(cl.get_settings())
+    print(json.dumps({"success": True, "mediaId": str(media.pk), "sessionData": new_session}))
+except LoginRequired:
+    print(json.dumps({"success": False, "error": "Session expired — please reconnect account"}))
+except PleaseWaitFewMinutes:
+    print(json.dumps({"success": False, "error": "Instagram rate limited — will retry soon"}))
+except Exception as e:
+    print(json.dumps({"success": False, "error": str(e)}))
+`;
+  return runPython(script, 120000);
 }
+
+// ── SESSION HEALTH CHECK ──────────────────────────────────────────────────────
+async function checkSessionHealth(accountId) {
+  const acc = await Account.findById(accountId);
+  if (!acc?.sessionData) return false;
+  const setup = pySetup(getProxy(acc), accountId.toString());
+  const safeSess = acc.sessionData.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const script = `
+${setup}
+try:
+    settings = json.loads('${safeSess}')
+    cl = make_client(proxy_url, saved_settings=settings)
+    cl.user_info(str(cl.user_id))
+    print(json.dumps({"ok": True}))
+except Exception as e:
+    print(json.dumps({"ok": False, "error": str(e)}))
+`;
+  const result = await runPython(script, 30000);
+  return result.ok === true;
+}
+
 
 // ── DOWNLOAD PIPELINE ─────────────────────────────────────────────────────────
 async function downloadFile(url, destPath) {
@@ -1392,29 +1352,11 @@ app.delete("/api/scrapers/:id", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── AI CAPTION ────────────────────────────────────────────────────────────────
-app.post("/api/caption/generate", auth, async (req, res) => {
-  try {
-    const { niche, style } = req.body;
-    const groqKey = process.env.GROQ_API_KEY;
-    if (!groqKey) return res.status(400).json({ error: "GROQ_API_KEY not set" });
-    const prompt = `Write a short Instagram Reels caption for a ${niche || "general"} page. Style: ${style || "engaging"}. Include 3-5 relevant hashtags at the end. Max 150 chars before hashtags. Return only the caption, nothing else.`;
-    const groqRes = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
-      model: "llama3-8b-8192",
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 200, temperature: 0.8,
-    }, { headers: { Authorization: `Bearer ${groqKey}`, "Content-Type": "application/json" }, timeout: 15000 });
-    const caption = groqRes.data.choices?.[0]?.message?.content?.trim() || "";
-    res.json({ caption });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── SMART SCHEDULE & SHADOWBAN ROUTES ───────────────────────────────────────
+// ── SMART SCHEDULE ROUTES ─────────────────────────────────────────────────────
 app.get("/api/accounts/:id/smart-schedule", auth, async (req, res) => {
   try {
     const acc = await Account.findOne({ _id: req.params.id, userId: req.user.id });
     if (!acc) return res.status(404).json({ error: "Not found" });
-    // Niche-based optimal posting times
     const nicheSchedules = {
       "Motivation":  ["06:00","08:00","12:00","18:00","21:00"],
       "Fitness":     ["06:00","07:00","12:00","17:00","20:00"],
@@ -1448,7 +1390,23 @@ app.post("/api/accounts/:id/apply-smart-schedule", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Per-video AI caption
+// ── AI CAPTION ────────────────────────────────────────────────────────────────
+app.post("/api/caption/generate", auth, async (req, res) => {
+  try {
+    const { niche, style } = req.body;
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) return res.status(400).json({ error: "GROQ_API_KEY not set" });
+    const prompt = `Write a short viral Instagram Reels caption for a ${niche || "general"} page. Style: ${style || "engaging"}. Include 3-5 relevant hashtags at the end. Max 150 chars before hashtags. Return only the caption, nothing else.`;
+    const groqRes = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
+      model: "llama3-8b-8192",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 200, temperature: 0.8,
+    }, { headers: { Authorization: `Bearer ${groqKey}`, "Content-Type": "application/json" }, timeout: 15000 });
+    const caption = groqRes.data.choices?.[0]?.message?.content?.trim() || "";
+    res.json({ caption });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post("/api/videos/:id/ai-caption", auth, async (req, res) => {
   try {
     const video = await Video.findOne({ _id: req.params.id, userId: req.user.id }).populate("accountId");
@@ -1468,7 +1426,7 @@ app.post("/api/videos/:id/ai-caption", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Plan management
+// Plan route
 app.get("/api/me/plan", auth, async (req, res) => {
   try {
     const user = await User.findById(req.user.id).select("plan trialEndsAt createdAt email");
