@@ -1811,4 +1811,15 @@ app.patch("/api/admin/users/:id", adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(process.env.PORT || 3001, () => console.log(`🚀 ReelFlow v5.0 on port ${process.env.PORT || 3001}`));
+app.listen(process.env.PORT || 3001, () => {
+  console.log(`🚀 ReelFlow v5.0 on port ${process.env.PORT || 3001}`);
+  // Test Python + instagrapi on startup
+  const { exec } = require("child_process");
+  exec('python3 -c "import instagrapi; print(\'✅ instagrapi ok\')"', { timeout: 15000 }, (err, stdout, stderr) => {
+    if (err) console.error("❌ instagrapi NOT available:", stderr || err.message);
+    else console.log(stdout.trim());
+  });
+  exec('python3 --version', (err, stdout, stderr) => {
+    console.log("Python:", stdout.trim() || stderr.trim());
+  });
+});
