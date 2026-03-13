@@ -936,10 +936,22 @@ app.get("/api/proxy/test-all", auth, async (req, res) => {
 });
 
 // ── INSTAGRAM PRIVATE API (replaces Python/instagrapi) ───────────────────────
-const { IgApiClient, IgCheckpointError, IgLoginBadPasswordError, IgLoginInvalidUserError,
-        IgNotFoundError, IgActionSpamError, IgResponseError } = require("instagram-private-api");
-const { StickerBuilder } = require("instagram-private-api/dist/sticker-builder");
-const Bluebird = require("bluebird");
+let IgApiClient, IgCheckpointError, IgLoginBadPasswordError, IgLoginInvalidUserError,
+    IgNotFoundError, IgActionSpamError, IgResponseError;
+try {
+  const igPkg = require("instagram-private-api");
+  IgApiClient = igPkg.IgApiClient;
+  IgCheckpointError = igPkg.IgCheckpointError;
+  IgLoginBadPasswordError = igPkg.IgLoginBadPasswordError;
+  IgLoginInvalidUserError = igPkg.IgLoginInvalidUserError;
+  IgNotFoundError = igPkg.IgNotFoundError;
+  IgActionSpamError = igPkg.IgActionSpamError;
+  IgResponseError = igPkg.IgResponseError;
+  console.log("✅ instagram-private-api loaded");
+} catch (e) {
+  console.error("❌ instagram-private-api NOT installed:", e.message);
+  console.error("Run: npm install instagram-private-api");
+}
 const { promisify } = require("util");
 const readFileAsync = promisify(require("fs").readFile);
 
@@ -992,6 +1004,9 @@ const humanDelay = (min = 2000, max = 6000) =>
 const pendingAuthorizations = new Map();
 
 async function igLogin(username, password, proxyUrl = "", accountId = "") {
+  if (!IgApiClient) {
+    return { success: false, error: "instagram-private-api not installed on server. Run: npm install" };
+  }
   const { ig } = createIgClient(accountId || username);
   ig.state.generateDevice(username); // deterministic device per username
   applyProxy(ig, proxyUrl);
@@ -1074,6 +1089,7 @@ async function igLogin(username, password, proxyUrl = "", accountId = "") {
         return { success: false, error: "Instagram is blocking this login. Try: open Instagram on your phone first, then reconnect." };
       }
     }
+    console.error(`igLogin full error for @${username}:`, e);
     return { success: false, error: e.message || "Login failed" };
   }
 }
