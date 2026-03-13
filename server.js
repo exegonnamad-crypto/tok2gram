@@ -976,7 +976,8 @@ ${proxyLine}
 
 def make_client(proxy='', saved_settings=None):
     cl = Client()
-    cl.delay_range = [2, 5]
+    cl.delay_range = [1, 2]
+    cl.request_timeout = 20
     if proxy:
         cl.set_proxy(proxy)
     cl.set_device({
@@ -1072,7 +1073,7 @@ except PleaseWaitFewMinutes:
 except Exception as e:
     print(json.dumps({"success": False, "error": str(e), "trace": traceback.format_exc()[-800:]}))
 `;
-  return runPython(script, 90000, { IG_PASSWORD: password });
+  return runPython(script, 40000, { IG_PASSWORD: password });
 }
 
 async function igLoginWithSession(username, password, tempSessionStr, proxyUrl = "", accountId = "") {
@@ -1102,7 +1103,7 @@ try:
 except Exception as e:
     print(json.dumps({"pending": True, "tempSession": "{}"}))
 `;
-  return runPython(script, 90000, { IG_PASSWORD: password });
+  return runPython(script, 40000, { IG_PASSWORD: password });
 }
 
 // ── POST VIDEO ────────────────────────────────────────────────────────────────
@@ -1144,7 +1145,7 @@ except PleaseWaitFewMinutes:
 except Exception as e:
     print(json.dumps({"success": False, "error": str(e)}))
 `;
-  return runPython(script, 120000);
+  return runPython(script, 60000);
 }
 
 // ── SESSION HEALTH CHECK ──────────────────────────────────────────────────────
