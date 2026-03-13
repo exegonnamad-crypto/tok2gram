@@ -1,28 +1,22 @@
-FROM node:18-slim
+FROM node:20-slim
 
-# Install Python and pip
 RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
-    python3-dev \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install instagrapi 2.3.0 + dependencies
-RUN pip3 install instagrapi==2.3.0 Pillow requests --break-system-packages
+    libglib2.0-0 libnss3 libnspr4 libdbus-1-3 libatk1.0-0 \
+    libatk-bridge2.0-0 libcups2 libxkbcommon0 libxcomposite1 \
+    libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
+    libcairo2 libasound2 fonts-liberation wget ca-certificates \
+    --no-install-recommends && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install node dependencies
 COPY package*.json ./
 RUN npm install
 
-# Copy app files
-COPY . .
+# Install Playwright's Chromium
+RUN npx playwright install chromium --with-deps
 
-# Create downloads directory
+COPY . .
 RUN mkdir -p downloads
 
 EXPOSE 3001
-
 CMD ["node", "server.js"]
