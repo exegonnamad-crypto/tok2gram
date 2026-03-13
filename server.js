@@ -4,6 +4,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
 const cron = require("node-cron");
+const { HttpsProxyAgent } = require("https-proxy-agent");
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
@@ -60,6 +61,7 @@ const Account = mongoose.model("Account", new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
   username: { type: String, trim: true },
   igPassword: { type: String, default: "" },
+  encryptedPassword: { type: String, default: "" }, // AES encrypted, for auto-reconnect
   igUserId: { type: String, default: "" },
   profilePic: { type: String, default: "" },
   sessionData: { type: String, default: "" },
@@ -238,6 +240,14 @@ async function notifyUser(userId, event, data = {}) {
         `ReelFlow is now managing this account automatically.`;
     }
 
+    else if (event === "reconnected" && user.notifyOnConnect) {
+      message =
+        `🔄 <b>Account Auto-Reconnected!</b>\n\n` +
+        `👤 Instagram: <b>@${data.username}</b>\n` +
+        `🕐 Time: ${timeStr} — ${dateStr}\n\n` +
+        `✅ ReelFlow automatically restored the session. Posting resumed.`;
+    }
+
     else if (event === "test") {
       message =
         `🤖 <b>ReelFlow Notifications Active!</b>\n\n` +
@@ -330,7 +340,7 @@ app.post("/api/instagram/verify", auth, async (req, res) => {
   const { username, password } = req.body;
   try {
     if (!username || !password) return res.status(400).json({ error: "Username and password required" });
-    const result = await instagrapiLogin(username, password);
+    const result = await igLogin(username, password);
     if (result.success) res.json({ success: true, userId: result.userId, username: result.username });
     else res.status(400).json({ success: false, error: result.error });
   } catch (e) {
@@ -347,13 +357,33 @@ app.get("/api/accounts/authorize-status/:sessionKey", auth, async (req, res) => 
   if (pending.userId !== req.user.id) return res.status(403).json({ error: "Unauthorized" });
 
   // Try login again with saved temp session
-  const result = await instagrapiLoginWithTempSession(pending.username, pending.password, pending.tempSession, pending.proxyUrl || "", pending.tempAccountId || "");
+  const result = await igLoginWithSession(pending.username, pending.password, pending.tempSession, pending.proxyUrl || "", pending.tempAccountId || "");
 
   if (result.success) {
     pendingAuthorizations.delete(sessionKey);
-    // Create the account
     try {
       const { niche, postsPerDay, hashtags, captionStyle, customCaption, autoRequeue, postingTimes } = pending.accountData;
+
+      // Reconnect — update existing account
+      if (pending.reconnectId) {
+        const acc = await Account.findOneAndUpdate(
+          { _id: pending.reconnectId, userId: req.user.id },
+          {
+            sessionData: result.sessionData || "",
+            sessionSavedAt: new Date(),
+            igUserId: result.userId || "",
+            igPassword: await bcrypt.hash(pending.password, 10),
+            encryptedPassword: encryptPassword(pending.password),
+            status: "active",
+          },
+          { new: true }
+        );
+        if (!acc) return res.status(404).json({ error: "Account not found" });
+        await logActivity(req.user.id, acc._id, acc.username, "reconnected", `🔄 @${acc.username} reconnected via phone auth`);
+        return res.json({ authorized: true, account: acc });
+      }
+
+      // New account
       const acc = await Account.create({
         userId: req.user.id,
         username: (result.username || pending.username || "").replace("@", "").toLowerCase().trim(),
@@ -371,7 +401,7 @@ app.get("/api/accounts/authorize-status/:sessionKey", auth, async (req, res) => 
         status: "active",
         proxyUrl: pending.proxyUrl || "",
       });
-      await logActivity(req.user.id, acc._id, "account_connected", `@${acc.username} connected via authorization`);
+      await logActivity(req.user.id, acc._id, acc.username, "connected", `✅ @${acc.username} connected via phone auth`);
       await notifyUser(req.user.id, "connected", { username: acc.username, niche: acc.niche });
       return res.json({ authorized: true, account: acc });
     } catch (e) {
@@ -396,7 +426,7 @@ app.post("/api/accounts/verify-code", auth, async (req, res) => {
     const { username, password, verificationCode, tempSession, niche, postsPerDay, hashtags, captionStyle, customCaption, autoRequeue, postingTimes } = req.body;
     if (!verificationCode) return res.status(400).json({ error: "Verification code required" });
 
-    const loginResult = await instagrapiLogin(username, password, verificationCode, tempSession);
+    const loginResult = await igLogin(username, password);
 
     if (loginResult.needsCode) return res.status(400).json({ error: "Code was incorrect, please try again" });
     if (!loginResult.success) return res.status(400).json({ error: `Login failed: ${loginResult.error}` });
@@ -406,6 +436,7 @@ app.post("/api/accounts/verify-code", auth, async (req, res) => {
       username: (loginResult.username || username || "").replace("@", "").toLowerCase().trim(),
       igUserId: loginResult.userId || "",
       igPassword: password ? await bcrypt.hash(password, 10) : "",
+        encryptedPassword: password ? encryptPassword(password) : "",
       sessionData: loginResult.sessionData || "",
       sessionSavedAt: new Date(),
       niche: niche || "General",
@@ -439,7 +470,7 @@ app.post("/api/accounts", auth, async (req, res) => {
     if (!igPass) return res.status(400).json({ error: "Password required" });
     if (!username) return res.status(400).json({ error: "Instagram username required" });
 
-    const loginResult = await instagrapiLogin(username, igPass, proxyUrl || "");
+    const loginResult = await igLogin(username, igPass, proxyUrl || "", reconnectId || "");
 
     // Instagram requires phone authorization
     if (loginResult.pending) {
@@ -449,16 +480,36 @@ app.post("/api/accounts", auth, async (req, res) => {
         username, password: igPass,
         tempSession: loginResult.tempSession || "{}",
         proxyUrl: proxyUrl || "",
+        tempAccountId: reconnectId || sessionKey,
+        reconnectId: reconnectId || null,
         accountData: { niche, postsPerDay, hashtags, captionStyle, customCaption, autoRequeue, postingTimes, proxyUrl },
         userId: req.user.id,
         createdAt: Date.now(),
       });
-      // Clean up after 5 minutes
       setTimeout(() => pendingAuthorizations.delete(sessionKey), 300000);
       return res.json({ pending: true, sessionKey, message: "Check your phone and tap 'This was me' to authorize" });
     }
 
     if (!loginResult.success) return res.status(400).json({ error: `Instagram login failed: ${loginResult.error}` });
+
+    // If reconnecting — update existing account session instead of creating new
+    if (reconnectId) {
+      const acc = await Account.findOneAndUpdate(
+        { _id: reconnectId, userId: req.user.id },
+        {
+          sessionData: loginResult.sessionData || "",
+          sessionSavedAt: new Date(),
+          igUserId: loginResult.userId || "",
+          igPassword: await bcrypt.hash(igPass, 10),
+      encryptedPassword: encryptPassword(igPass),
+          status: "active",
+        },
+        { new: true }
+      );
+      if (!acc) return res.status(404).json({ error: "Account not found" });
+      await logActivity(req.user.id, acc._id, acc.username, "reconnected", `🔄 @${acc.username} reconnected`);
+      return res.json({ ...acc.toObject(), igPassword: "***", sessionData: undefined });
+    }
 
     const acc = await Account.create({
       userId: req.user.id,
@@ -479,14 +530,7 @@ app.post("/api/accounts", auth, async (req, res) => {
     });
 
     await logActivity(req.user.id, acc._id, acc.username, "connected", `✅ @${acc.username} connected`);
-
-    // 🔔 Telegram: account connected
-    notifyUser(req.user.id, "connected", {
-      username: acc.username,
-      niche: acc.niche,
-      postsPerDay: acc.postsPerDay,
-    });
-
+    notifyUser(req.user.id, "connected", { username: acc.username, niche: acc.niche, postsPerDay: acc.postsPerDay });
     res.json({ ...acc.toObject(), igPassword: "***", sessionData: undefined });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -535,69 +579,28 @@ app.get("/api/accounts/:id/profile", auth, async (req, res) => {
 
     if (!acc.sessionData) return res.status(400).json({ error: "No session data" });
 
-    const result = await new Promise((resolve) => {
-      const script = `
-import sys, json
-try:
-    from instagrapi import Client
-    cl = Client()
-    settings = json.loads('''${acc.sessionData.replace(/'/g, "\\'")}''')
-    cl.set_settings(settings)
-    try:
-        info = cl.account_info()
-        print(json.dumps({
-            "success": True,
-            "username": str(info.username),
-            "fullName": str(info.full_name or ""),
-            "bio": str(info.biography or ""),
-            "followers": int(info.follower_count or 0),
-            "following": int(info.following_count or 0),
-            "posts": int(info.media_count or 0),
-            "profilePic": str(info.profile_pic_url or ""),
-            "isVerified": bool(info.is_verified),
-        }))
-    except Exception as e1:
-        # Fallback for newer IG API fields
-        try:
-            uid = str(cl.user_id)
-            info2 = cl.user_info(uid)
-            print(json.dumps({
-                "success": True,
-                "username": str(info2.username),
-                "fullName": str(info2.full_name or ""),
-                "bio": str(info2.biography or ""),
-                "followers": int(info2.follower_count or 0),
-                "following": int(info2.following_count or 0),
-                "posts": int(info2.media_count or 0),
-                "profilePic": str(info2.profile_pic_url or ""),
-                "isVerified": bool(info2.is_verified),
-            }))
-        except Exception as e2:
-            print(json.dumps({"success": False, "error": str(e2)}))
-except Exception as e:
-    print(json.dumps({"success": False, "error": str(e)}))
-`;
-      const { spawn } = require("child_process");
-      const py = spawn("python3", ["-c", script]);
-      let output = "", errOutput = "";
-      py.stdout.on("data", d => output += d.toString());
-      py.stderr.on("data", d => errOutput += d.toString());
-      py.on("close", () => {
-        try {
-          const lines = output.trim().split("\n").reverse();
-          for (const line of lines) {
-            try {
-              const parsed = JSON.parse(line.trim());
-              if (parsed && "success" in parsed) { resolve(parsed); return; }
-            } catch {}
-          }
-          resolve({ success: false, error: errOutput || "No response" });
-        } catch {
-          resolve({ success: false, error: "Python error" });
-        }
-      });
-      setTimeout(() => { py.kill(); resolve({ success: false, error: "Timeout" }); }, 30000);
-    });
+    // Fetch profile using instagram-private-api
+    let result = { success: false, error: "Could not fetch profile" };
+    try {
+      const { ig } = createIgClient(acc._id.toString());
+      ig.state.generateDevice(acc.username);
+      applyProxy(ig, getProxy(acc));
+      await ig.state.deserialize(JSON.parse(acc.sessionData));
+      const info = await ig.account.currentUser();
+      result = {
+        success: true,
+        username: info.username,
+        fullName: info.full_name || "",
+        bio: info.biography || "",
+        followers: info.follower_count || 0,
+        following: info.following_count || 0,
+        posts: info.media_count || 0,
+        profilePic: info.profile_pic_url || "",
+        isVerified: info.is_verified || false,
+      };
+    } catch (e) {
+      result = { success: false, error: e.message };
+    }
 
     if (!result.success) return res.status(400).json({ error: result.error });
     // cache profile data on account
@@ -887,7 +890,6 @@ app.post("/api/proxy/test", auth, async (req, res) => {
   const { proxyUrl } = req.body;
   if (!proxyUrl) return res.status(400).json({ error: "proxyUrl required" });
   try {
-    const { HttpsProxyAgent } = require("https-proxy-agent");
     const agent = new HttpsProxyAgent(proxyUrl);
     const start = Date.now();
     const ipRes = await axios.get("https://api.ipify.org?format=json", {
@@ -913,8 +915,7 @@ app.get("/api/proxy/test-all", auth, async (req, res) => {
   if (user?.role !== "admin") return res.status(403).json({ error: "Admin only" });
   const results = await Promise.all(proxyPool.proxies.map(async (proxyUrl) => {
     try {
-      const { HttpsProxyAgent } = require("https-proxy-agent");
-      const agent = new HttpsProxyAgent(proxyUrl);
+        const agent = new HttpsProxyAgent(proxyUrl);
       const start = Date.now();
       const ipRes = await axios.get("https://api.ipify.org?format=json", {
         httpsAgent: agent, proxy: false, timeout: 8000,
@@ -927,417 +928,312 @@ app.get("/api/proxy/test-all", auth, async (req, res) => {
   res.json(results);
 });
 
-// ── SHARED PYTHON HELPERS ─────────────────────────────────────────────────────
+// ── INSTAGRAM PRIVATE API (replaces Python/instagrapi) ───────────────────────
+const { IgApiClient, IgCheckpointError, IgLoginBadPasswordError, IgLoginInvalidUserError,
+        IgNotFoundError, IgActionSpamError, IgResponseError } = require("instagram-private-api");
+const { StickerBuilder } = require("instagram-private-api/dist/sticker-builder");
+const Bluebird = require("bluebird");
+const { promisify } = require("util");
+const readFileAsync = promisify(require("fs").readFile);
+
 // ── DEVICE FINGERPRINT GENERATOR ─────────────────────────────────────────────
-// Each account gets its own unique persistent Android device fingerprint
-// seeded from account ID so it's always the same device for that account
 const ANDROID_DEVICES = [
-  { manufacturer: "Samsung",  model: "SM-G991B",  device: "o1s",       cpu: "exynos2100",  android: 31, release: "12",   dpi: "480dpi",  res: "1080x2340" },
-  { manufacturer: "Samsung",  model: "SM-A536B",  device: "a53x",      cpu: "exynos1280",  android: 31, release: "12",   dpi: "400dpi",  res: "1080x2408" },
-  { manufacturer: "OnePlus",  model: "CPH2399",   device: "op535",     cpu: "qcom",        android: 31, release: "12",   dpi: "450dpi",  res: "1080x2400" },
-  { manufacturer: "Xiaomi",   model: "2201123G",  device: "cupid",     cpu: "qcom",        android: 32, release: "12",   dpi: "460dpi",  res: "1080x2400" },
-  { manufacturer: "Xiaomi",   model: "220733SG",  device: "munch",     cpu: "qcom",        android: 31, release: "12",   dpi: "440dpi",  res: "1080x2400" },
-  { manufacturer: "Realme",   model: "RMX3563",   device: "RM6785",    cpu: "mt6785",      android: 30, release: "11",   dpi: "400dpi",  res: "1080x2400" },
-  { manufacturer: "Oppo",     model: "CPH2387",   device: "OP52C1L1",  cpu: "mt6877",      android: 31, release: "12",   dpi: "400dpi",  res: "1080x2400" },
-  { manufacturer: "Vivo",     model: "V2109",     device: "vivo1920",  cpu: "mt6768",      android: 30, release: "11",   dpi: "400dpi",  res: "1080x2400" },
-  { manufacturer: "Motorola", model: "XT2201-3",  device: "tesla",     cpu: "qcom",        android: 31, release: "12",   dpi: "400dpi",  res: "1080x2400" },
-  { manufacturer: "Nokia",    model: "TA-1428",   device: "NokiaX30",  cpu: "qcom",        android: 31, release: "12",   dpi: "400dpi",  res: "1080x2340" },
+  { manufacturer: "Samsung",  model: "SM-G991B",  device: "o1s",      android_version: "12", android_release: "12" },
+  { manufacturer: "Samsung",  model: "SM-A536B",  device: "a53x",     android_version: "12", android_release: "12" },
+  { manufacturer: "OnePlus",  model: "CPH2399",   device: "op535",    android_version: "12", android_release: "12" },
+  { manufacturer: "Xiaomi",   model: "2201123G",  device: "cupid",    android_version: "12", android_release: "12" },
+  { manufacturer: "Xiaomi",   model: "220733SG",  device: "munch",    android_version: "12", android_release: "12" },
+  { manufacturer: "Realme",   model: "RMX3563",   device: "RM6785",   android_version: "11", android_release: "11" },
+  { manufacturer: "Oppo",     model: "CPH2387",   device: "OP52C1L1", android_version: "12", android_release: "12" },
+  { manufacturer: "Vivo",     model: "V2109",     device: "vivo1920", android_version: "11", android_release: "11" },
+  { manufacturer: "Motorola", model: "XT2201-3",  device: "tesla",    android_version: "12", android_release: "12" },
+  { manufacturer: "Nokia",    model: "TA-1428",   device: "NokiaX30", android_version: "12", android_release: "12" },
 ];
 
-const IG_APP_VERSIONS = [
-  { version: "269.0.0.18.75", code: "301484483" },
-  { version: "271.0.0.19.87", code: "303748645" },
-  { version: "275.0.0.27.98", code: "307866453" },
-  { version: "278.0.0.18.87", code: "310924460" },
-  { version: "281.0.0.20.101","code": "313884060" },
-];
-
-function getDeviceFingerprint(accountId) {
-  // Seed from accountId — always same device for same account
-  const seed = accountId.toString();
-  let hash = 0;
-  for (let i = 0; i < seed.length; i++) {
-    hash = ((hash << 5) - hash) + seed.charCodeAt(i);
-    hash |= 0;
-  }
-  const abs = Math.abs(hash);
-  const device = ANDROID_DEVICES[abs % ANDROID_DEVICES.length];
-  const appVer = IG_APP_VERSIONS[abs % IG_APP_VERSIONS.length];
-
-  // Generate deterministic UUIDs from seed
-  const uuidFromSeed = (extra) => {
-    let h = abs + extra;
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-      h = ((h << 5) - h) + c.charCodeAt(0); h |= 0;
-      const v = c === 'x' ? (Math.abs(h) % 16) : ((Math.abs(h) % 4) + 8);
-      return v.toString(16);
-    });
-  };
-
-  return {
-    device,
-    appVersion: appVer.version,
-    versionCode: appVer.code,
-    phoneId: uuidFromSeed(1),
-    uuid: uuidFromSeed(2),
-    clientSessionId: uuidFromSeed(3),
-    advertisingId: uuidFromSeed(4),
-    deviceId: `android-${Math.abs(abs * 7 + 13).toString(16).slice(0, 16)}`,
-    userAgent: `Instagram ${appVer.version} Android (${device.android}/${device.release}; ${device.dpi}; ${device.res}; ${device.manufacturer}; ${device.model}; ${device.device}; ${device.cpu}; en_US; ${appVer.code})`,
-  };
+function seedRandom(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) { h = Math.imul(31, h) + str.charCodeAt(i) | 0; }
+  return Math.abs(h);
 }
 
-const pySetup = (proxyUrl = "", accountId = "") => {
-  const fp = accountId ? getDeviceFingerprint(accountId) : getDeviceFingerprint("default");
-  return `
-import sys, json, time, uuid, random, hashlib
-
-DEVICE_SETTINGS = {
-    "app_version": "${fp.appVersion}",
-    "android_version": ${fp.device.android},
-    "android_release": "${fp.device.release}",
-    "dpi": "${fp.device.dpi}",
-    "resolution": "${fp.device.res}",
-    "manufacturer": "${fp.device.manufacturer}",
-    "device": "${fp.device.device}",
-    "model": "${fp.device.model}",
-    "cpu": "${fp.device.cpu}",
-    "version_code": "${fp.versionCode}",
+function getDeviceForAccount(accountId) {
+  const seed = seedRandom(accountId.toString());
+  return ANDROID_DEVICES[seed % ANDROID_DEVICES.length];
 }
 
-UUIDS = {
-    "phone_id": "${fp.phoneId}",
-    "uuid": "${fp.uuid}",
-    "client_session_id": "${fp.clientSessionId}",
-    "advertising_id": "${fp.advertisingId}",
-    "device_id": "${fp.deviceId}",
+// Create a fresh IgApiClient with device fingerprint seeded from accountId
+function createIgClient(accountId = "default") {
+  const ig = new IgApiClient();
+  const device = getDeviceForAccount(accountId);
+  // instagram-private-api generates device from username seed — we override after
+  return { ig, device };
 }
 
-USER_AGENT = "${fp.userAgent}"
+// Apply proxy to ig client
+function applyProxy(ig, proxyUrl) {
+  if (!proxyUrl) return;
+  try {
+    ig.state.proxyUrl = proxyUrl;
+  } catch {}
+}
 
-def make_client(proxy_url=None, saved_settings=None):
-    from instagrapi import Client
-    cl = Client()
-    cl.delay_range = [3, 7]
+// Simulate human-like delay
+const humanDelay = (min = 2000, max = 6000) =>
+  new Promise(r => setTimeout(r, min + Math.random() * (max - min)));
 
-    if proxy_url:
-        cl.set_proxy(proxy_url)
-
-    if saved_settings:
-        try:
-            cl.set_settings(saved_settings)
-            # Always enforce our device fingerprint even on restored sessions
-            cl.set_device(DEVICE_SETTINGS)
-            cl.set_uuids(UUIDS)
-            cl.user_agent = USER_AGENT
-        except:
-            pass
-    else:
-        # Fresh session — apply full fingerprint
-        cl.set_device(DEVICE_SETTINGS)
-        cl.set_uuids(UUIDS)
-        cl.user_agent = USER_AGENT
-
-    # ── Auto-handle ALL challenge types ──────────────────────────────────────
-    def challenge_handler(username, choice):
-        try:
-            cl.challenge_resolve(cl.last_json)
-        except:
-            pass
-        time.sleep(2)
-        return 0
-
-    cl.challenge_code_handler = challenge_handler
-
-    # ── Auto-dismiss "automated behavior" / feedback_required popup ──────────
-    original_request = cl._send_private_request
-
-    def patched_request(endpoint, **kwargs):
-        try:
-            return original_request(endpoint, **kwargs)
-        except Exception as e:
-            err = str(e)
-            if "feedback_required" in err or "automated" in err.lower():
-                try:
-                    cl.private_request("consent/existing_user_flow/", data={
-                        "current_screen_key": "qp_intro",
-                        "updates": json.dumps({"existing_user_flow_intro_key": "seen"})
-                    })
-                    time.sleep(random.uniform(3, 5))
-                    return original_request(endpoint, **kwargs)
-                except:
-                    pass
-            raise
-
-    cl._send_private_request = patched_request
-
-    return cl
-
-proxy_url = ${proxyUrl ? `"${proxyUrl}"` : 'None'}
-`;
-};
-
-
-// ── INSTAGRAPI — PASSWORD LOGIN ───────────────────────────────────────────────
-// In-memory store for pending authorizations
+// ── LOGIN ─────────────────────────────────────────────────────────────────────
 const pendingAuthorizations = new Map();
 
-async function instagrapiLogin(username, password, proxyUrl = "", accountId = "") {
-  return new Promise((resolve) => {
-    const setup = pySetup(proxyUrl, accountId);
-    const script = `
-${setup}
-try:
-    from instagrapi.exceptions import ChallengeRequired, LoginRequired, FeedbackRequired
+async function igLogin(username, password, proxyUrl = "", accountId = "") {
+  const { ig } = createIgClient(accountId || username);
+  ig.state.generateDevice(username); // deterministic device per username
+  applyProxy(ig, proxyUrl);
 
-    cl = make_client(proxy_url)
-
-    def try_login(cl, username, password, attempt=1):
-        try:
-            cl.login(username, password)
-            return {"success": True}
-        except FeedbackRequired as fe:
-            # "We suspect automated behavior" — auto-dismiss and retry
-            err = str(fe)
-            try:
-                # Acknowledge the popup
-                cl.private_request("consent/existing_user_flow/", data={
-                    "current_screen_key": "qp_intro",
-                    "updates": json.dumps({"existing_user_flow_intro_key": "seen"})
-                })
-                time.sleep(random.uniform(4, 7))
-            except:
-                pass
-            if attempt < 3:
-                time.sleep(random.uniform(5, 10))
-                return try_login(cl, username, password, attempt + 1)
-            return {"success": False, "error": "Instagram flagged this login. Try again in a few minutes or use a proxy."}
-        except ChallengeRequired:
-            return {"pending": True}
-        except Exception as e:
-            err = str(e)
-            if "challenge" in err.lower() or "verify" in err.lower() or "feedback" in err.lower() or "wait" in err.lower() or "automated" in err.lower():
-                if attempt < 2:
-                    time.sleep(random.uniform(5, 10))
-                    return try_login(cl, username, password, attempt + 1)
-                return {"pending": True}
-            return {"success": False, "error": err}
-
-    result = try_login(cl, '${username}', '${password}')
-
-    if result.get("success"):
-        session = json.dumps(cl.get_settings())
-        user_id = str(cl.user_id)
-        print(json.dumps({"success": True, "userId": user_id, "username": "${username}", "sessionData": session}))
-    elif result.get("pending"):
-        try:
-            temp = json.dumps(cl.get_settings())
-        except:
-            temp = "{}"
-        print(json.dumps({"pending": True, "tempSession": temp}))
-    else:
-        print(json.dumps({"success": False, "error": result.get("error", "Unknown error")}))
-
-except Exception as e:
-    print(json.dumps({"success": False, "error": str(e)}))
-`;
-    const py = spawn("python3", ["-c", script]);
-    let output = "", errOutput = "";
-    py.stdout.on("data", d => output += d.toString());
-    py.stderr.on("data", d => errOutput += d.toString());
-    py.on("close", () => {
+  try {
+    await ig.simulate.preLoginFlow();
+    const loggedInUser = await ig.account.login(username, password);
+    await humanDelay(1000, 3000);
+    await ig.simulate.postLoginFlow();
+    const session = await ig.state.serialize();
+    delete session.constants; // don't store constants
+    return {
+      success: true,
+      userId: loggedInUser.pk.toString(),
+      username: loggedInUser.username,
+      sessionData: JSON.stringify(session),
+    };
+  } catch (e) {
+    if (e instanceof IgCheckpointError) {
+      // Instagram wants phone/email challenge — this is normal, handle it
       try {
-        const lines = output.trim().split("\n").reverse();
-        for (const line of lines) {
-          try {
-            const parsed = JSON.parse(line.trim());
-            if (parsed && typeof parsed === "object" && ("success" in parsed || "pending" in parsed)) {
-              resolve(parsed); return;
-            }
-          } catch {}
-        }
-        resolve({ success: false, error: errOutput || "Python/Instagrapi not available" });
-      } catch {
-        resolve({ success: false, error: errOutput || "Python/Instagrapi not available" });
+        await ig.challenge.auto(true); // request SMS/push challenge
+        const session = await ig.state.serialize();
+        delete session.constants;
+        return {
+          pending: true,
+          tempSession: JSON.stringify(session),
+          challengeUrl: ig.state.checkpoint?.challenge?.api_path,
+        };
+      } catch (ce) {
+        return { pending: true, tempSession: "{}" };
       }
-    });
-    setTimeout(() => { py.kill(); resolve({ success: false, error: "Login timeout — please try again" }); }, 180000);
-  });
+    }
+    if (e instanceof IgLoginBadPasswordError) {
+      return { success: false, error: "Wrong password — please check and try again" };
+    }
+    if (e instanceof IgLoginInvalidUserError) {
+      return { success: false, error: "Instagram account not found — check the username" };
+    }
+    if (e instanceof IgActionSpamError) {
+      return { success: false, error: "Instagram rate limit — wait 10 minutes and try again" };
+    }
+    const msg = e.message?.toLowerCase() || "";
+    if (msg.includes("challenge") || msg.includes("checkpoint") || msg.includes("verify")) {
+      return { pending: true, tempSession: "{}" };
+    }
+    if (msg.includes("feedback") || msg.includes("automated") || msg.includes("suspicious")) {
+      // Try preLoginFlow reset and retry once
+      try {
+        const { ig: ig2 } = createIgClient(accountId || username);
+        ig2.state.generateDevice(username);
+        applyProxy(ig2, proxyUrl);
+        await humanDelay(8000, 15000);
+        await ig2.simulate.preLoginFlow();
+        const loggedInUser2 = await ig2.account.login(username, password);
+        await ig2.simulate.postLoginFlow();
+        const session2 = await ig2.state.serialize();
+        delete session2.constants;
+        return {
+          success: true,
+          userId: loggedInUser2.pk.toString(),
+          username: loggedInUser2.username,
+          sessionData: JSON.stringify(session2),
+        };
+      } catch (e2) {
+        if (e2 instanceof IgCheckpointError) {
+          try {
+            const session = await ig.state.serialize();
+            delete session.constants;
+            return { pending: true, tempSession: JSON.stringify(session) };
+          } catch { return { pending: true, tempSession: "{}" }; }
+        }
+        return { success: false, error: "Instagram is blocking this login. Try: open Instagram on your phone first, then reconnect." };
+      }
+    }
+    return { success: false, error: e.message || "Login failed" };
+  }
 }
 
-async function instagrapiLoginWithTempSession(username, password, tempSession, proxyUrl = "", accountId = "") {
-  return new Promise((resolve) => {
-    const safeTempSession = (tempSession || "{}").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    const setup = pySetup(proxyUrl, accountId);
-    const script = `
-${setup}
-try:
-    from instagrapi.exceptions import ChallengeRequired, FeedbackRequired
+// Poll after user taps "This was me" on phone
+async function igLoginWithSession(username, password, tempSessionStr, proxyUrl = "", accountId = "") {
+  const { ig } = createIgClient(accountId || username);
+  ig.state.generateDevice(username);
+  applyProxy(ig, proxyUrl);
 
-    saved = None
-    try:
-        saved = json.loads('${safeTempSession}')
-    except:
-        pass
+  // Restore saved state if available
+  if (tempSessionStr && tempSessionStr !== "{}") {
+    try {
+      await ig.state.deserialize(JSON.parse(tempSessionStr));
+    } catch {}
+  }
 
-    cl = make_client(proxy_url, saved_settings=saved)
-
-    try:
-        cl.login('${username}', '${password}')
-        session = json.dumps(cl.get_settings())
-        user_id = str(cl.user_id)
-        print(json.dumps({"success": True, "userId": user_id, "username": "${username}", "sessionData": session}))
-    except FeedbackRequired:
-        try:
-            cl.private_request("consent/existing_user_flow/", data={
-                "current_screen_key": "qp_intro",
-                "updates": json.dumps({"existing_user_flow_intro_key": "seen"})
-            })
-            time.sleep(random.uniform(4, 7))
-            cl.login('${username}', '${password}')
-            session = json.dumps(cl.get_settings())
-            user_id = str(cl.user_id)
-            print(json.dumps({"success": True, "userId": user_id, "username": "${username}", "sessionData": session}))
-        except ChallengeRequired:
-            print(json.dumps({"pending": True}))
-        except:
-            print(json.dumps({"pending": True}))
-    except ChallengeRequired:
-        print(json.dumps({"pending": True}))
-    except Exception as e2:
-        err = str(e2)
-        if "challenge" in err.lower() or "verify" in err.lower() or "feedback" in err.lower() or "automated" in err.lower():
-            print(json.dumps({"pending": True}))
-        else:
-            print(json.dumps({"success": False, "error": err}))
-
-except Exception as e:
-    print(json.dumps({"success": False, "error": str(e)}))
-`;
-    const py = spawn("python3", ["-c", script]);
-    let output = "", errOutput = "";
-    py.stdout.on("data", d => output += d.toString());
-    py.stderr.on("data", d => errOutput += d.toString());
-    py.on("close", () => {
+  try {
+    await ig.simulate.preLoginFlow();
+    const loggedInUser = await ig.account.login(username, password);
+    await humanDelay(1000, 2000);
+    await ig.simulate.postLoginFlow();
+    const session = await ig.state.serialize();
+    delete session.constants;
+    return {
+      success: true,
+      userId: loggedInUser.pk.toString(),
+      username: loggedInUser.username,
+      sessionData: JSON.stringify(session),
+    };
+  } catch (e) {
+    if (e instanceof IgCheckpointError) {
       try {
-        const lines = output.trim().split("\n").reverse();
-        for (const line of lines) {
-          try {
-            const parsed = JSON.parse(line.trim());
-            if (parsed && typeof parsed === "object" && ("success" in parsed || "pending" in parsed)) {
-              resolve(parsed); return;
-            }
-          } catch {}
-        }
-        resolve({ success: false, error: errOutput || "No response" });
+        // Check if checkpoint was already resolved (user tapped approve)
+        await ig.challenge.auto(true);
+        const session = await ig.state.serialize();
+        delete session.constants;
+        // Still pending — user hasn't tapped yet
+        return { pending: true, tempSession: JSON.stringify(session) };
       } catch {
-        resolve({ success: false, error: "Python error" });
+        return { pending: true, tempSession: tempSessionStr };
       }
+    }
+    if (e instanceof IgLoginBadPasswordError) {
+      return { success: false, error: "Wrong password" };
+    }
+    const msg = e.message?.toLowerCase() || "";
+    if (msg.includes("challenge") || msg.includes("checkpoint") || msg.includes("verify")) {
+      return { pending: true, tempSession: tempSessionStr };
+    }
+    return { success: false, error: e.message || "Login failed" };
+  }
+}
+
+// ── POST TO INSTAGRAM ─────────────────────────────────────────────────────────
+async function igPost(sessionData, videoPath, caption, proxyUrl = "", accountId = "") {
+  if (!sessionData) return { success: false, error: "No session — please reconnect account" };
+
+  const { ig } = createIgClient(accountId);
+  ig.state.generateDevice(accountId || "default");
+  applyProxy(ig, proxyUrl);
+
+  try {
+    await ig.state.deserialize(JSON.parse(sessionData));
+  } catch (e) {
+    return { success: false, error: "Invalid session — please reconnect account" };
+  }
+
+  try {
+    await humanDelay(2000, 5000);
+
+    const videoBuffer = await readFileAsync(videoPath);
+
+    // Upload as reel (clip)
+    const publishResult = await ig.publish.video({
+      video: videoBuffer,
+      coverImage: videoBuffer, // instagram-private-api extracts frame automatically
+      caption: caption,
     });
-    setTimeout(() => { py.kill(); resolve({ pending: true }); }, 60000);
-  });
+
+    // Save updated session
+    let newSession = "";
+    try {
+      const updated = await ig.state.serialize();
+      delete updated.constants;
+      newSession = JSON.stringify(updated);
+    } catch {}
+
+    return {
+      success: true,
+      mediaId: publishResult.media?.pk?.toString() || publishResult.media?.id || "",
+      sessionData: newSession,
+    };
+  } catch (e) {
+    const msg = e.message?.toLowerCase() || "";
+
+    if (msg.includes("login_required") || msg.includes("not authorized") || msg.includes("checkpoint")) {
+      return { success: false, error: "Session expired — please reconnect account" };
+    }
+    if (msg.includes("feedback") || msg.includes("spam") || msg.includes("action_blocked")) {
+      return { success: false, error: "Instagram blocked this action — wait 30 minutes and retry" };
+    }
+    if (msg.includes("transcode") || msg.includes("video") || msg.includes("upload")) {
+      return { success: false, error: `Video upload failed: ${e.message}` };
+    }
+    return { success: false, error: e.message || "Post failed" };
+  }
 }
 
 // ── DOWNLOAD PIPELINE ─────────────────────────────────────────────────────────
-async function getVideoInfo(videoUrl) {
-  if (videoUrl.includes("tiktok.com")) {
-    const apiUrl = `https://tikwm.com/api/?url=${encodeURIComponent(videoUrl)}&hd=1`;
-    const response = await axios.get(apiUrl, { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 15000 });
-    const data = response.data;
-    if (data.code === 0 && data.data) {
-      return {
-        videoUrl: data.data.play || data.data.wmplay,
-        caption: data.data.title || "",
-        author: data.data.author?.nickname || "",
-        videoId: data.data.id || "",
-        thumbnail: data.data.cover || "",
-        duration: data.data.duration || 0,
-      };
-    }
-    throw new Error("Video unavailable — may be private or deleted");
-  }
-  return { videoUrl, caption: "", author: "", videoId: "", thumbnail: "", duration: 0 };
-}
-
-function downloadFile(url, dest) {
+async function downloadFile(url, destPath) {
+  const writer = fs.createWriteStream(destPath);
+  const response = await axios({ url, method: "GET", responseType: "stream", timeout: 120000,
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } });
+  response.data.pipe(writer);
   return new Promise((resolve, reject) => {
-    const proto = url.startsWith("https") ? https : http;
-    const file = fs.createWriteStream(dest);
-    proto.get(url, { headers: { "User-Agent": "Mozilla/5.0" } }, (response) => {
-      if (response.statusCode === 301 || response.statusCode === 302) {
-        file.close();
-        return downloadFile(response.headers.location, dest).then(resolve).catch(reject);
-      }
-      if (response.statusCode !== 200) {
-        file.close(); fs.unlink(dest, () => {});
-        return reject(new Error(`HTTP ${response.statusCode}`));
-      }
-      response.pipe(file);
-      file.on("finish", () => file.close(resolve));
-    }).on("error", (err) => { fs.unlink(dest, () => {}); reject(err); });
+    writer.on("finish", resolve);
+    writer.on("error", reject);
   });
 }
 
-async function downloadVideo(videoId, url) {
-  await Video.findByIdAndUpdate(videoId, { status: "downloading", error: "" });
-  const dir = path.join(__dirname, "downloads");
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const out = path.join(dir, `${videoId}.mp4`);
+async function downloadVideo(videoId, videoUrl) {
   try {
-    const info = await getVideoInfo(url);
-    await downloadFile(info.videoUrl, out);
-    const stats = fs.statSync(out);
-    if (stats.size < 1000) throw new Error("File too small — invalid video");
-    await Video.findByIdAndUpdate(videoId, {
-      status: "downloaded", localPath: out,
-      caption: info.caption, videoAuthor: info.author,
-      videoId: info.videoId, thumbnailUrl: info.thumbnail, duration: info.duration,
-    });
-    console.log(`✅ Downloaded: ${videoId}`);
-    uploadToCloudinary(videoId, out);
-  } catch (err) {
-    console.error(`❌ Download failed: ${err.message}`);
-    await Video.findByIdAndUpdate(videoId, { status: "failed", error: err.message });
-  }
-}
+    await Video.findByIdAndUpdate(videoId, { status: "downloading" });
+    const dir = path.join(__dirname, "downloads");
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const localPath = path.join(dir, `${videoId}.mp4`);
 
-async function uploadToCloudinary(videoId, filePath) {
-  try {
-    const cloudinary = require("cloudinary").v2;
-    cloudinary.config({
-      cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-      api_key: process.env.CLOUDINARY_API_KEY,
-      api_secret: process.env.CLOUDINARY_API_SECRET,
+    let downloadUrl = videoUrl;
+    try {
+      const apiRes = await axios.get(`https://tikwm.com/api/?url=${encodeURIComponent(videoUrl)}&hd=1`,
+        { timeout: 15000, headers: { "User-Agent": "Mozilla/5.0" } });
+      if (apiRes.data?.data?.play) downloadUrl = apiRes.data.data.play;
+      else if (apiRes.data?.data?.hdplay) downloadUrl = apiRes.data.data.hdplay;
+    } catch {}
+
+    await downloadFile(downloadUrl, localPath);
+
+    let cloudinaryUrl = "";
+    try {
+      const upload = await cloudinary.uploader.upload(localPath, {
+        resource_type: "video", folder: "reelflow",
+        public_id: `video_${videoId}`, overwrite: true,
+      });
+      cloudinaryUrl = upload.secure_url;
+    } catch (ce) { console.error("Cloudinary upload error:", ce.message); }
+
+    await Video.findByIdAndUpdate(videoId, {
+      status: "downloaded", localPath, cloudinaryUrl,
+      downloadedAt: new Date(), error: "",
     });
-    const result = await cloudinary.uploader.upload(filePath, { resource_type: "video", folder: "reelflow", timeout: 120000 });
-    await Video.findByIdAndUpdate(videoId, { cloudinaryUrl: result.secure_url });
-    fs.unlink(filePath, () => {});
-    console.log(`☁️ Cloudinary done: ${videoId}`);
   } catch (e) {
-    console.error("❌ Cloudinary error:", e.message);
-    await Video.findByIdAndUpdate(videoId, { error: `Cloudinary: ${e.message}` });
+    await Video.findByIdAndUpdate(videoId, { status: "failed", error: e.message });
+    console.error(`Download failed for ${videoId}:`, e.message);
   }
 }
 
 // ── CAPTION BUILDER ───────────────────────────────────────────────────────────
 function buildCaption(video, account) {
-  // Always use original TikTok caption — no rewriting
   let caption = video.caption || "";
-  // Optionally append account hashtags at the end
-  if (account.hashtags && account.hashtags.trim()) {
+  if (account.hashtags?.trim()) {
     caption = caption ? `${caption}\n\n${account.hashtags.trim()}` : account.hashtags.trim();
   }
-  return caption.trim().slice(0, 2200);
+  return caption;
 }
 
-// ── POST TO INSTAGRAM ─────────────────────────────────────────────────────────
+// ── POST TO INSTAGRAM (orchestrator) ─────────────────────────────────────────
 async function postToInstagram(videoId) {
   const video = await Video.findById(videoId).populate("accountId");
   if (!video?.accountId) return;
   const account = video.accountId;
 
   if (!account.sessionData) {
-    await Video.findByIdAndUpdate(videoId, { status: "failed", error: "No session — please reconnect account with your cookie" });
+    await Video.findByIdAndUpdate(videoId, { status: "failed", error: "No session — please reconnect account" });
     return;
   }
 
@@ -1354,7 +1250,7 @@ async function postToInstagram(videoId) {
     }
 
     const caption = buildCaption(video, account);
-    const result = await postViaInstagrapi(account.sessionData, videoPath, caption, getProxy(account), account._id.toString());
+    const result = await igPost(account.sessionData, videoPath, caption, getProxy(account), account._id.toString());
 
     if (!result.success) throw new Error(result.error);
 
@@ -1363,9 +1259,7 @@ async function postToInstagram(videoId) {
     }
 
     const updatedAccount = await Account.findByIdAndUpdate(
-      account._id,
-      { $inc: { totalPosted: 1 }, lastPostedAt: new Date(), status: "active" },
-      { new: true }
+      account._id, { $inc: { totalPosted: 1 }, lastPostedAt: new Date(), status: "active" }, { new: true }
     );
 
     await Video.findByIdAndUpdate(videoId, { status: "posted", postedAt: new Date(), igPostId: result.mediaId || "", error: "" });
@@ -1374,12 +1268,9 @@ async function postToInstagram(videoId) {
     await logActivity(account.userId, account._id, account.username, "posted", `✅ Posted reel to @${account.username}`);
     console.log(`🎉 Posted to @${account.username}`);
 
-    // 🔔 Telegram: post success
     notifyUser(account.userId, "posted", {
-      username: account.username,
-      igPostId: result.mediaId || "",
-      totalPosted: updatedAccount?.totalPosted || account.totalPosted + 1,
-      caption: caption,
+      username: account.username, igPostId: result.mediaId || "",
+      totalPosted: updatedAccount?.totalPosted || account.totalPosted + 1, caption,
     });
 
     if (account.autoRequeue) {
@@ -1389,7 +1280,7 @@ async function postToInstagram(videoId) {
 
   } catch (e) {
     const v2 = await Video.findById(videoId);
-    const isSessionError = e.message.includes("login") || e.message.includes("LoginRequired") || e.message.includes("session");
+    const isSessionError = e.message.includes("login") || e.message.includes("session") || e.message.includes("reconnect");
     if (v2 && v2.retryCount < 2 && !isSessionError) {
       await Video.findByIdAndUpdate(videoId, { status: "downloaded", $inc: { retryCount: 1 } });
       setTimeout(() => postToInstagram(videoId), 120000);
@@ -1399,176 +1290,45 @@ async function postToInstagram(videoId) {
     if (isSessionError) await Account.findByIdAndUpdate(account._id, { status: "error" });
     await logActivity(account.userId, account._id, account.username, "failed", `❌ Post failed @${account.username}: ${e.message}`);
     console.error(`❌ Post failed @${account.username}: ${e.message}`);
-
-    // 🔔 Telegram: post failed
-    notifyUser(account.userId, "failed", {
-      username: account.username,
-      error: e.message,
-    });
+    notifyUser(account.userId, "failed", { username: account.username, error: e.message });
   }
 }
-
-async function postViaInstagrapi(sessionData, videoPath, caption, proxyUrl = "", accountId = "") {
-  return new Promise((resolve) => {
-    if (!sessionData) {
-      resolve({ success: false, error: "No session — please reconnect your Instagram account" });
-      return;
-    }
-    const escapedCaption = caption.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n");
-    const escapedPath = videoPath.replace(/\\/g, "/");
-    const setup = pySetup(proxyUrl, accountId);
-    const safeSession = sessionData.replace(/'/g, "\\'");
-    const script = `
-${setup}
-try:
-    from instagrapi.exceptions import LoginRequired, PleaseWaitFewMinutes, FeedbackRequired
-
-    settings = json.loads('''${safeSession}''')
-    cl = make_client(proxy_url, saved_settings=settings)
-
-    # Re-inject session cookie
-    cookies = settings.get("cookies", {})
-    session_id = cookies.get("sessionid", "")
-    if session_id:
-        try:
-            cl.login_by_sessionid(session_id)
-        except FeedbackRequired:
-            # Auto-dismiss "automated behavior" popup and continue
-            try:
-                cl.private_request("consent/existing_user_flow/", data={
-                    "current_screen_key": "qp_intro",
-                    "updates": json.dumps({"existing_user_flow_intro_key": "seen"})
-                })
-                time.sleep(random.uniform(3, 5))
-                cl.login_by_sessionid(session_id)
-            except Exception as dismiss_err:
-                # Continue anyway — session might still be valid
-                pass
-        except Exception:
-            pass
-
-    # Human-like delay before posting
-    time.sleep(random.uniform(3, 6))
-
-    def do_upload():
-        return cl.clip_upload('${escapedPath}', caption='${escapedCaption}')
-
-    # Try upload — auto-handle feedback_required during upload too
-    try:
-        media = do_upload()
-    except FeedbackRequired:
-        try:
-            cl.private_request("consent/existing_user_flow/", data={
-                "current_screen_key": "qp_intro",
-                "updates": json.dumps({"existing_user_flow_intro_key": "seen"})
-            })
-            time.sleep(random.uniform(5, 8))
-            media = do_upload()
-        except Exception as fe2:
-            raise Exception(f"Feedback required after dismiss: {str(fe2)}")
-
-    try:
-        new_session = json.dumps(cl.get_settings())
-    except:
-        new_session = ""
-
-    print(json.dumps({"success": True, "mediaId": str(media.pk), "sessionData": new_session}))
-
-except LoginRequired:
-    print(json.dumps({"success": False, "error": "Session expired — please reconnect your account"}))
-except PleaseWaitFewMinutes:
-    print(json.dumps({"success": False, "error": "Instagram rate limited — will retry in a few minutes"}))
-except Exception as e:
-    print(json.dumps({"success": False, "error": str(e)}))
-`;
-    const py = spawn("python3", ["-c", script]);
-    let output = "", errOutput = "";
-    py.stdout.on("data", d => output += d.toString());
-    py.stderr.on("data", d => errOutput += d.toString());
-    py.on("close", () => {
-      try {
-        const lines = output.trim().split("\n").reverse();
-        let result = null;
-        for (const line of lines) {
-          try {
-            const parsed = JSON.parse(line.trim());
-            if (parsed && typeof parsed === "object" && "success" in parsed) { result = parsed; break; }
-          } catch {}
-        }
-        resolve(result || { success: false, error: errOutput || output || "No valid response" });
-      } catch {
-        resolve({ success: false, error: errOutput || "Instagrapi error" });
-      }
-    });
-    setTimeout(() => { py.kill(); resolve({ success: false, error: "Post timeout (120s)" }); }, 120000);
-  });
-}
-
 
 // ── ANALYTICS ─────────────────────────────────────────────────────────────────
 app.get("/api/analytics", auth, async (req, res) => {
   try {
-    const days = parseInt(req.query.days) || 7;
-    const since = new Date(Date.now() - days * 86400000);
-
-    const [posted, failed, accounts] = await Promise.all([
-      Video.find({ userId: req.user.id, status: "posted", postedAt: { $gte: since } }),
-      Video.countDocuments({ userId: req.user.id, status: "failed", createdAt: { $gte: since } }),
-      Account.find({ userId: req.user.id }),
+    const accounts = await Account.find({ userId: req.user.id });
+    const accountIds = accounts.map(a => a._id);
+    const now = new Date();
+    const day7 = new Date(now - 7 * 86400000);
+    const day30 = new Date(now - 30 * 86400000);
+    const [posted7, posted30, failed7, totalPosted, queueSize] = await Promise.all([
+      Video.countDocuments({ accountId: { $in: accountIds }, status: "posted", postedAt: { $gte: day7 } }),
+      Video.countDocuments({ accountId: { $in: accountIds }, status: "posted", postedAt: { $gte: day30 } }),
+      Video.countDocuments({ accountId: { $in: accountIds }, status: "failed", createdAt: { $gte: day7 } }),
+      Video.countDocuments({ accountId: { $in: accountIds }, status: "posted" }),
+      Video.countDocuments({ accountId: { $in: accountIds }, status: { $in: ["queued", "downloaded"] } }),
     ]);
-
-    const total = posted.length;
-    const successRate = total + failed > 0 ? Math.round((total / (total + failed)) * 100) : 100;
-
-    // Daily breakdown
-    const dailyMap = {};
-    for (let i = days - 1; i >= 0; i--) {
-      const d = new Date(Date.now() - i * 86400000);
-      const key = d.toISOString().split("T")[0];
-      dailyMap[key] = 0;
+    const daily = [];
+    for (let i = 6; i >= 0; i--) {
+      const start = new Date(now); start.setDate(start.getDate() - i); start.setHours(0,0,0,0);
+      const end = new Date(start); end.setHours(23,59,59,999);
+      const count = await Video.countDocuments({ accountId: { $in: accountIds }, status: "posted", postedAt: { $gte: start, $lte: end } });
+      daily.push({ date: start.toISOString().slice(0,10), count });
     }
-    posted.forEach(v => {
-      const key = new Date(v.postedAt).toISOString().split("T")[0];
-      if (dailyMap[key] !== undefined) dailyMap[key]++;
-    });
-    const dailyPosts = Object.entries(dailyMap).map(([date, count]) => ({ date, count }));
-
-    // Hourly breakdown
-    const hourly = Array(24).fill(0).map((_, i) => ({ hour: i, count: 0 }));
-    posted.forEach(v => { hourly[new Date(v.postedAt).getHours()].count++; });
-
-    // Top accounts
-    const accMap = {};
-    posted.forEach(v => {
-      const id = v.accountId?.toString();
-      if (id) accMap[id] = (accMap[id] || 0) + 1;
-    });
-    const topAccounts = Object.entries(accMap)
-      .sort(([, a], [, b]) => b - a)
-      .slice(0, 5)
-      .map(([id, count]) => {
-        const acc = accounts.find(a => a._id.toString() === id);
-        return { id, username: acc?.username || "unknown", posted: count };
-      });
-
-    res.json({
-      totalPosted: total,
-      avgPerDay: (total / days).toFixed(1),
-      activeAccounts: accounts.filter(a => a.status === "active").length,
-      successRate,
-      dailyPosts,
-      hourlyBreakdown: hourly,
-      topAccounts,
-    });
+    const accountStats = await Promise.all(accounts.map(async (acc) => ({
+      username: acc.username, status: acc.status, totalPosted: acc.totalPosted || 0,
+      postsPerDay: acc.postsPerDay, lastPostedAt: acc.lastPostedAt,
+      queueSize: await Video.countDocuments({ accountId: acc._id, status: { $in: ["queued", "downloaded"] } }),
+    })));
+    res.json({ posted7, posted30, failed7, totalPosted, queueSize, daily, accountStats });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── SCRAPER ROUTES ────────────────────────────────────────────────────────────
 app.get("/api/scrapers", auth, async (req, res) => {
   try {
-    const scrapers = await Scraper.find({ userId: req.user.id })
-      .populate("accountId", "username")
-      .sort({ createdAt: -1 });
+    const scrapers = await Scraper.find({ userId: req.user.id }).populate("accountId", "username");
     res.json(scrapers);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1576,18 +1336,15 @@ app.get("/api/scrapers", auth, async (req, res) => {
 app.post("/api/scrapers", auth, async (req, res) => {
   try {
     const { type, query, accountId, interval, maxPerRun, skipDuplicates } = req.body;
-    if (!query) return res.status(400).json({ error: "Query required" });
-    if (!accountId) return res.status(400).json({ error: "Account required" });
+    if (!query || !accountId) return res.status(400).json({ error: "Query and account required" });
     const acc = await Account.findOne({ _id: accountId, userId: req.user.id });
     if (!acc) return res.status(404).json({ error: "Account not found" });
     const scraper = await Scraper.create({
-      userId: req.user.id, accountId, type: type || "username",
-      query: query.replace(/^[@#]/, "").trim(),
+      userId: req.user.id, accountId, type: type || "username", query: query.replace(/^[@#]/, ""),
       interval: interval || 60, maxPerRun: maxPerRun || 5,
-      skipDuplicates: skipDuplicates !== false,
-      nextRun: new Date(),
+      skipDuplicates: skipDuplicates !== false, status: "active", nextRun: new Date(),
     });
-    res.json(await scraper.populate("accountId", "username"));
+    res.json(scraper);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1598,7 +1355,16 @@ app.post("/api/scrapers/:id/toggle", auth, async (req, res) => {
     s.status = s.status === "active" ? "paused" : "active";
     if (s.status === "active") s.nextRun = new Date();
     await s.save();
-    res.json({ status: s.status });
+    res.json(s);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/scrapers/:id/run", auth, async (req, res) => {
+  try {
+    const s = await Scraper.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!s) return res.status(404).json({ error: "Not found" });
+    runScraper(s._id);
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1609,109 +1375,89 @@ app.delete("/api/scrapers/:id", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/api/scrapers/:id/run", auth, async (req, res) => {
+// ── AI CAPTION ────────────────────────────────────────────────────────────────
+app.post("/api/caption/generate", auth, async (req, res) => {
   try {
-    const s = await Scraper.findOne({ _id: req.params.id, userId: req.user.id });
-    if (!s) return res.status(404).json({ error: "Not found" });
-    runScraper(s._id);
-    res.json({ message: "Scraper started" });
+    const { niche, style } = req.body;
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) return res.status(400).json({ error: "GROQ_API_KEY not set" });
+    const prompt = `Write a short Instagram Reels caption for a ${niche || "general"} page. Style: ${style || "engaging"}. Include 3-5 relevant hashtags at the end. Max 150 chars before hashtags. Return only the caption, nothing else.`;
+    const groqRes = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
+      model: "llama3-8b-8192",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 200, temperature: 0.8,
+    }, { headers: { Authorization: `Bearer ${groqKey}`, "Content-Type": "application/json" }, timeout: 15000 });
+    const caption = groqRes.data.choices?.[0]?.message?.content?.trim() || "";
+    res.json({ caption });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── AI CAPTION ────────────────────────────────────────────────────────────────
-app.post("/api/videos/:id/ai-caption", auth, async (req, res) => {
+// ── SMART SCHEDULE & SHADOWBAN ROUTES ───────────────────────────────────────
+app.get("/api/accounts/:id/smart-schedule", auth, async (req, res) => {
   try {
-    const video = await Video.findOne({ _id: req.params.id, userId: req.user.id });
-    if (!video) return res.status(404).json({ error: "Video not found" });
-
-    const original = (video.caption || "").trim();
-    const account = await Account.findById(video.accountId);
-    const niche = account?.niche || "General";
-    const existingHashtags = (account?.hashtags || "").trim();
-
-    const prompt = `You are an Instagram Reels caption expert.
-
-Original TikTok caption: "${original || "(no caption)"}"
-Account niche: ${niche}
-
-Your job:
-1. Rewrite the caption to be more engaging and punchy for Instagram Reels. Keep the same meaning but make it catchier, add personality, use 1-3 relevant emojis naturally. Keep it under 180 characters.
-2. Generate 8-12 highly relevant hashtags for this content and niche. Mix popular (#reels, #viral) with niche-specific ones. Do NOT repeat any of these existing hashtags: ${existingHashtags}
-
-Respond ONLY in this exact JSON format, nothing else:
-{"caption": "your rewritten caption here", "hashtags": "#tag1 #tag2 #tag3"}`;
-
-    const response = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
-      model: "llama3-8b-8192",
-      max_tokens: 300,
-      messages: [{ role: "user", content: prompt }],
-    }, {
-      headers: {
-        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      timeout: 20000,
-    });
-
-    const raw = response.data.choices[0].message.content.trim();
-    let caption = original;
-    let hashtags = existingHashtags;
-
-    try {
-      const cleaned = raw.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(cleaned);
-      caption = parsed.caption || original;
-      // Merge new hashtags with existing ones, deduplicated
-      const existingSet = new Set(existingHashtags.split(/\s+/).filter(Boolean));
-      const newTags = (parsed.hashtags || "").split(/\s+/).filter(t => t.startsWith("#") && !existingSet.has(t));
-      hashtags = [...existingSet, ...newTags].join(" ").trim();
-    } catch {
-      // fallback: use raw as caption if JSON parse fails
-      caption = raw.slice(0, 200);
-    }
-
-    await Video.findByIdAndUpdate(video._id, { caption, hashtags });
-    res.json({ caption, hashtags });
-  } catch (e) {
-    console.error("AI caption error:", e.message);
-    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
-  }
+    const acc = await Account.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!acc) return res.status(404).json({ error: "Not found" });
+    // Niche-based optimal posting times
+    const nicheSchedules = {
+      "Motivation":  ["06:00","08:00","12:00","18:00","21:00"],
+      "Fitness":     ["06:00","07:00","12:00","17:00","20:00"],
+      "Crypto":      ["08:00","12:00","16:00","20:00","22:00"],
+      "Anime":       ["12:00","15:00","18:00","20:00","22:00"],
+      "Cars":        ["09:00","12:00","17:00","19:00","21:00"],
+      "Luxury":      ["10:00","13:00","17:00","19:00","21:00"],
+      "General":     ["09:00","12:00","15:00","18:00","21:00"],
+    };
+    const times = nicheSchedules[acc.niche] || nicheSchedules["General"];
+    res.json({ niche: acc.niche, suggestedTimes: times.slice(0, acc.postsPerDay) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── SESSION HEALTH CHECK ──────────────────────────────────────────────────────
-async function checkSessionHealth(accountId) {
-  const acc = await Account.findById(accountId);
-  if (!acc || !acc.sessionData) return false;
+app.post("/api/accounts/:id/apply-smart-schedule", auth, async (req, res) => {
+  try {
+    const acc = await Account.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!acc) return res.status(404).json({ error: "Not found" });
+    const nicheSchedules = {
+      "Motivation":  ["06:00","08:00","12:00","18:00","21:00"],
+      "Fitness":     ["06:00","07:00","12:00","17:00","20:00"],
+      "Crypto":      ["08:00","12:00","16:00","20:00","22:00"],
+      "Anime":       ["12:00","15:00","18:00","20:00","22:00"],
+      "Cars":        ["09:00","12:00","17:00","19:00","21:00"],
+      "Luxury":      ["10:00","13:00","17:00","19:00","21:00"],
+      "General":     ["09:00","12:00","15:00","18:00","21:00"],
+    };
+    const times = (nicheSchedules[acc.niche] || nicheSchedules["General"]).slice(0, acc.postsPerDay);
+    await Account.findByIdAndUpdate(acc._id, { postingTimes: times });
+    res.json({ success: true, postingTimes: times });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-  return new Promise((resolve) => {
-    const setup = pySetup(getProxy(acc), acc._id.toString());
-    const safeSession = acc.sessionData.replace(/'/g, "\\'");
-    const script = `
-${setup}
-try:
-    settings = json.loads(\'\'\'${safeSession}\'\'\')
-    cl = make_client(proxy_url, saved_settings=settings)
-    # Use a lightweight API call instead of timeline feed (less suspicious)
-    cl.user_info(str(cl.user_id))
-    print(json.dumps({"ok": True}))
-except Exception as e:
-    print(json.dumps({"ok": False, "error": str(e)}))
-`;
-    const py = spawn("python3", ["-c", script]);
-    let output = "";
-    py.stdout.on("data", d => output += d.toString());
-    py.on("close", () => {
-      try {
-        const lines = output.trim().split("\n").reverse();
-        for (const line of lines) {
-          try { const r = JSON.parse(line); if ("ok" in r) { resolve(r.ok); return; } } catch {}
-        }
-        resolve(false);
-      } catch { resolve(false); }
-    });
-    setTimeout(() => { py.kill(); resolve(false); }, 30000);
-  });
-}
+// Per-video AI caption
+app.post("/api/videos/:id/ai-caption", auth, async (req, res) => {
+  try {
+    const video = await Video.findOne({ _id: req.params.id, userId: req.user.id }).populate("accountId");
+    if (!video) return res.status(404).json({ error: "Not found" });
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) return res.status(400).json({ error: "GROQ_API_KEY not set" });
+    const niche = video.accountId?.niche || "general";
+    const prompt = `Write a short viral Instagram Reels caption for a ${niche} page. Max 100 chars. Include 3-5 hashtags. Return only the caption.`;
+    const groqRes = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
+      model: "llama3-8b-8192",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 150, temperature: 0.9,
+    }, { headers: { Authorization: `Bearer ${groqKey}`, "Content-Type": "application/json" }, timeout: 15000 });
+    const caption = groqRes.data.choices?.[0]?.message?.content?.trim() || "";
+    await Video.findByIdAndUpdate(video._id, { caption });
+    res.json({ caption });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Plan management
+app.get("/api/me/plan", auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select("plan trialEndsAt createdAt email");
+    res.json({ plan: user?.plan || "free", trialEndsAt: user?.trialEndsAt, email: user?.email });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── SCRAPER ENGINE ────────────────────────────────────────────────────────────
 async function runScraper(scraperId) {
@@ -1924,20 +1670,71 @@ cron.schedule("* * * * *", async () => {
   } catch (e) { console.error("Scraper cron error:", e.message); }
 });
 
-// Session health check every 2 hours
+// ── AUTO-RECONNECT HELPER ─────────────────────────────────────────────────────
+const crypto = require("crypto");
+const RECON_SECRET = (process.env.JWT_SECRET || "reelflow").slice(0, 32).padEnd(32, "0");
+
+function encryptPassword(plain) {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv("aes-256-cbc", Buffer.from(RECON_SECRET), iv);
+  return iv.toString("hex") + ":" + Buffer.concat([cipher.update(plain), cipher.final()]).toString("hex");
+}
+
+function decryptPassword(enc) {
+  try {
+    const [ivHex, dataHex] = enc.split(":");
+    const decipher = crypto.createDecipheriv("aes-256-cbc", Buffer.from(RECON_SECRET), Buffer.from(ivHex, "hex"));
+    return Buffer.concat([decipher.update(Buffer.from(dataHex, "hex")), decipher.final()]).toString();
+  } catch { return null; }
+}
+
+async function tryAutoReconnect(acc) {
+  if (!acc.encryptedPassword) return false;
+  const plain = decryptPassword(acc.encryptedPassword);
+  if (!plain) return false;
+  console.log(`🔄 Auto-reconnecting @${acc.username}...`);
+  try {
+    const proxy = getProxy(acc);
+    const result = await igLogin(acc.username, plain, proxy, acc._id.toString());
+    if (result.success && result.sessionData) {
+      await Account.findByIdAndUpdate(acc._id, {
+        sessionData: result.sessionData,
+        sessionSavedAt: new Date(),
+        status: "active",
+      });
+      await logActivity(acc.userId, acc._id, acc.username, "reconnected", `🔄 @${acc.username} auto-reconnected successfully`);
+      await notifyUser(acc.userId, "reconnected", { username: acc.username });
+      console.log(`✅ Auto-reconnected @${acc.username}`);
+      return true;
+    }
+    // Needs phone approval — can't auto-approve, notify user
+    return false;
+  } catch (e) {
+    console.error(`Auto-reconnect failed for @${acc.username}:`, e.message);
+    return false;
+  }
+}
+
+// Session health check every 2 hours — tries auto-reconnect, falls back to Telegram alert
 cron.schedule("0 */2 * * *", async () => {
   try {
     const accounts = await Account.find({ status: "active" });
     for (const acc of accounts) {
       const healthy = await checkSessionHealth(acc._id);
       if (!healthy) {
-        await Account.findByIdAndUpdate(acc._id, { status: "error" });
-        await logActivity(acc.userId, acc._id, acc.username, "session_error", `⚠️ Session expired for @${acc.username} — reconnect needed`);
-        notifyUser(acc.userId, "failed", {
-          username: acc.username,
-          error: "Session cookie expired. Please reconnect your account with a fresh cookie.",
-        });
-        console.log(`⚠️ Session dead: @${acc.username}`);
+        console.log(`⚠️ Session dead: @${acc.username} — attempting auto-reconnect`);
+        const reconnected = await tryAutoReconnect(acc);
+        if (!reconnected) {
+          await Account.findByIdAndUpdate(acc._id, { status: "error" });
+          await logActivity(acc.userId, acc._id, acc.username, "session_error", `⚠️ Session expired for @${acc.username} — reconnect needed`);
+          // Telegram notification with instructions
+          const user = await User.findById(acc.userId).select("telegramBotToken telegramChatId");
+          if (user?.telegramBotToken && user?.telegramChatId) {
+            const msg = `⚠️ *ReelFlow Alert*\n\n@${acc.username} session expired and auto-reconnect failed.\n\n👉 Go to Accounts → tap *Reconnect* on @${acc.username} → enter password → approve on phone.\n\nPosting is paused for this account until reconnected.`;
+            await sendTelegram(user.telegramBotToken, user.telegramChatId, msg);
+          }
+          console.log(`❌ Auto-reconnect failed for @${acc.username} — user notified`);
+        }
       }
     }
   } catch (e) { console.error("Health check error:", e.message); }
