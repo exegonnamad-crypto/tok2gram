@@ -76,6 +76,7 @@ const Account = mongoose.model("Account", new mongoose.Schema({
   autoRequeue: { type: Boolean, default: false },
   status: { type: String, default: "active", enum: ["active", "paused", "error", "shadowbanned"] },
   proxyUrl: { type: String, default: "" },
+  proxyMode: { type: String, default: "rotate", enum: ["none", "fixed", "rotate"] },
   // ── Warm-up system ──
   warmupEnabled: { type: Boolean, default: true },
   warmupDay: { type: Number, default: 0 },         // how many days old this account is
@@ -841,10 +842,16 @@ const proxyPool = {
   },
 };
 
-// Get proxy for account: use account's own proxy if set, else rotate from pool
+// Get proxy for account based on proxyMode
+// - "none"   → no proxy (direct connection)
+// - "fixed"  → always use account's own proxyUrl
+// - "rotate" → pick next proxy from pool each time (default)
 function getProxy(account) {
-  if (account?.proxyUrl) return account.proxyUrl;
-  return proxyPool.next();
+  const mode = account?.proxyMode || "rotate";
+  if (mode === "none") return "";
+  if (mode === "fixed") return account?.proxyUrl || "";
+  // rotate mode — use account's proxy if set, otherwise take next from pool
+  return account?.proxyUrl || proxyPool.next();
 }
 
 // Admin: manage proxy pool
@@ -989,7 +996,14 @@ async function igLogin(username, password, proxyUrl = "", accountId = "") {
   ig.state.generateDevice(username); // deterministic device per username
   applyProxy(ig, proxyUrl);
 
+  // Wipe any existing session from DB before logging in fresh
+  // This prevents "multiple sessions" error — Instagram sees it as same device re-logging in
+  if (accountId) {
+    try { await Account.findByIdAndUpdate(accountId, { sessionData: null, sessionSavedAt: null }); } catch {}
+  }
+
   try {
+    await humanDelay(2000, 4000); // wait before login attempt
     await ig.simulate.preLoginFlow();
     const loggedInUser = await ig.account.login(username, password);
     await humanDelay(1000, 3000);
