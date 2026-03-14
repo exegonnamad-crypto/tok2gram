@@ -1,26 +1,28 @@
-FROM node:20-slim
+FROM node:18-slim
 
+# Install Python and pip
 RUN apt-get update && apt-get install -y \
-    chromium \
-    libglib2.0-0 libnss3 libnspr4 libdbus-1-3 \
-    libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
-    libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
-    libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
-    fonts-liberation ca-certificates wget \
-    --no-install-recommends && rm -rf /var/lib/apt/lists/*
+    python3 \
+    python3-pip \
+    python3-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install instagrapi 2.3.0 + dependencies
+RUN pip3 install instagrapi==2.3.0 Pillow requests --break-system-packages
 
 WORKDIR /app
 
+# Install node dependencies
 COPY package*.json ./
 RUN npm install
 
-# Skip Playwright's browser download — use the system chromium instead
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
-ENV CHROME_EXECUTABLE_PATH=/usr/bin/chromium
-
+# Copy app files
 COPY . .
+
+# Create downloads directory
 RUN mkdir -p downloads
 
 EXPOSE 3001
+
 CMD ["node", "server.js"]
