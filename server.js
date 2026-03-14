@@ -362,11 +362,26 @@ async function launchBrowser(accountId, sessionData = null) {
 
   const browser = await chromium.launch({
     headless: true,
+    channel: undefined,          // use bundled chromium, not chrome/msedge
+    executablePath: process.env.CHROME_EXECUTABLE_PATH || undefined,
     args: [
-      "--no-sandbox", "--disable-setuid-sandbox",
-      "--disable-blink-features=AutomationControlled",
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
+      "--no-zygote",               // critical: avoids SIGTRAP in restricted containers
+      "--single-process",          // critical: Railway has no zygote support
+      "--disable-blink-features=AutomationControlled",
+      "--disable-features=VizDisplayCompositor",
+      "--disable-background-networking",
+      "--disable-extensions",
+      "--disable-sync",
+      "--disable-translate",
+      "--hide-scrollbars",
+      "--metrics-recording-only",
+      "--mute-audio",
+      "--no-first-run",
+      "--safebrowsing-disable-auto-update",
       "--window-size=1280,800",
     ],
   });
@@ -1102,7 +1117,7 @@ async function tryAutoReconnect(accountId) {
 // ── TEST PYTHON ───────────────────────────────────────────────────────────────
 app.get("/api/test-browser", auth, async (req, res) => {
   try {
-    const b = await chromium.launch({ headless: true, args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"] });
+    const b = await chromium.launch({ headless: true, args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--no-zygote","--single-process","--disable-gpu"] });
     const p = await b.newPage();
     await p.goto("https://www.instagram.com/", { waitUntil: "domcontentloaded", timeout: 15000 });
     const title = await p.title();
